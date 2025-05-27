@@ -3746,7 +3746,333 @@ def test_difficulty_across_modes(
     plt.tight_layout()
     fig.savefig('modes_testing.png', dpi=150, bbox_inches='tight')
     plt.close(fig)
+def plot_decision_comparison(
+        bk_vals:      np.ndarray,
+        decisions:    Dict[str, np.ndarray],
+        *,
+        b_star:       float = 0.0,
+        show_all:     bool  = False,
+        sample_ids:   List   = None,
+        jitter:       float  = 0.08,
+        figsize:      Tuple[int, int] = (10, 3.2)
+    ) -> Tuple[plt.Figure, np.ndarray]:
+    """
+    ------------------------------------------------------------------
+    Visualises, on a single scatter-plot, how *each* decision rule
+    (Oracle / Deep-offload / Entropy) assigns a sample to **local**
+    or **cloud** execution as a function of its bk score.
 
+    • **Colour encodes the rule**  (green = Oracle, orange = Deep-offload,
+      purple = Entropy).
+    • **Marker fill encodes the decision**  (hollow circle → local,
+      filled circle → cloud).
+    • An optional vertical dashed line (b_star) shows the oracle split.
+    • Optionally, agreed-upon samples are shown in light-grey when
+      `show_all=True`.
+    • The function prints concise statistics to stdout and
+      returns the indices of “disagreement” samples so you can inspect
+      them later (e.g. look at the raw image/feature maps).
+
+    Parameters
+    ----------
+    bk_vals
+        1-D array (length **N**) with bk value for each test sample.
+    decisions
+        Dictionary with identical-length (N) int arrays.  Keys must include
+        'Oracle', 'Deep-offload', and 'Entropy'.  Each array must contain
+        **0 for local** and **1 for cloud**.
+    b_star
+        The oracle’s threshold on bk.  Plotted as dashed grey line so you
+        can instantly see on which side of the split a sample lies.
+    show_all
+        • False  → plot ONLY samples where at least two rules disagree
+                   (focus on the interesting cases).
+        • True   → overlay the full test set (agreed samples as faint squares
+                   below the main axis) so you keep context.
+    sample_ids
+        Optional list/array of sample identifiers (filenames, indices, …) of
+        length N.  They are *not* shown in the plot yet, but they propagate
+        into the returned `mismatch_idx` for later debugging.
+    jitter
+        Standard deviation of vertical random noise applied to each point so
+        overlapping dots remain distinguishable.
+    figsize
+        Matplotlib figure size.
+
+    Returns
+    -------
+    fig
+        The Matplotlib Figure object – keep / save it as you wish.
+    mismatch_idx
+        `np.ndarray` of integer indices (w.r.t. original test order) where
+        at least one rule gives a different decision from the rest.
+
+    Notes
+    -----
+    • The function prints, for **every** rule, the % of local/cloud
+      decisions and the global mismatch percentage.
+    • Because the arrays are flattened once, any torch tensors should be
+      sent as `.cpu().numpy()` beforehand.
+    ------------------------------------------------------------------
+    """
+    # ------------------------------------------------------------------
+    # Sanity-check the input
+    # ------------------------------------------------------------------
+    method_names = list(decisions)                     # keep insertion order
+    bk           = np.asarray(bk_vals).flatten()
+    dec_stack    = np.vstack([np.asarray(decisions[m]).flatten()
+                              for m in method_names])
+    assert dec_stack.shape[1] == bk.size, \
+        "bk_vals and all decision arrays must have the same length"
+
+    # ------------------------------------------------------------------
+    # Determine which samples are “interesting” (disagreement)
+    # ------------------------------------------------------------------
+    mismatch_mask = ~(np.all(dec_stack == dec_stack[0], axis=0))
+    keep_mask     = np.ones_like(mismatch_mask, dtype=bool) if show_all else mismatch_mask
+
+    bk_plot       = bk[keep_mask]
+    dec_plot      = {m: dec_stack[i, keep_mask] for i, m in enumerate(method_names)}
+    mismatch_idx  = np.nonzero(mismatch_mask)[0]
+
+    # ------------------------------------------------------------------
+    # Print quick stats to terminal
+    # ------------------------------------------------------------------
+    total_N = len(bk)
+    print(f"[plot_decision_comparison] mismatch samples: "
+          f"{mismatch_idx.size}/{total_N} ({100*mismatch_idx.size/total_N:.2f} %)")
+
+    for m in method_names:
+        n_local = int((decisions[m] == 0).sum())
+        n_cloud = total_N - n_local
+        print(f"  {m:<12}: local {100*n_local/total_N:5.2f}% | "
+              f"cloud {100*n_cloud/total_N:5.2f}%")
+
+    # ------------------------------------------------------------------
+    # Build colour/marker maps
+    # ------------------------------------------------------------------
+    palette = {'Entropy':'mediumpurple', 'Deep-offload':'darkorange', 'Oracle':'seagreen'}
+    y_map   = {m:i for i, m in enumerate(method_names)}
+
+    # ------------------------------------------------------------------
+    # Start plotting
+    # ------------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # (Optional) show agreed-upon samples in the background for context
+    if show_all:
+        agree_mask = ~mismatch_mask
+        if agree_mask.any():
+            ax.scatter(bk[agree_mask],
+                       np.full(agree_mask.sum(), -0.5),
+                       s=30, c='lightgrey', alpha=0.6, marker='s',
+                       label='agreed samples')
+
+    # Plot each rule, differentiating local/cloud by fill
+    for m, colour in palette.items():
+        dec_arr = dec_plot[m]
+        y_base  = y_map[m]
+        # vertical jitter avoids identical-y stacking
+        y_jit   = y_base + np.random.normal(0, jitter, size=dec_arr.size)
+
+        for choice in (0, 1):          # 0 = local, 1 = cloud
+            mask  = dec_arr == choice
+            if not mask.any():
+                continue
+            face  = colour if choice else 'none'   # hollow for local
+            edge  = colour
+            ax.scatter(bk_plot[mask], y_jit[mask],
+                       s=90, linewidths=1.2,
+                       facecolors=face, edgecolors=edge, marker='o',
+                       label=f"{m} {'cloud' if choice else 'local'}"
+                             if choice == 0 else None)  # legend once per rule
+
+    # Draw oracle split
+    ax.axvline(b_star, ls='--', c='grey', lw=1.2, label=f'b* = {b_star:.2f}')
+
+    # Axis cosmetics
+    ax.set_yticks(list(y_map.values()))
+    ax.set_yticklabels(method_names, fontsize=12)
+    ax.set_xlabel('bk', fontsize=12)
+    ax.set_title("Decision comparison" +
+                 ("" if show_all else " (mismatch samples)"),
+                 fontsize=13, pad=10)
+    ax.grid(axis='x', alpha=0.3)
+
+    # Unique legend (avoid duplicates due to per-choice loop above)
+    handles, labels = ax.get_legend_handles_labels()
+    uniq            = dict(zip(labels, handles))
+    ax.legend(uniq.values(), uniq.keys(),
+              bbox_to_anchor=(1.02, 1), loc="upper left")
+
+    plt.tight_layout()
+    return fig, mismatch_idx
+
+
+# ----------------------------------------------------------------------
+#  EVALUATION LOOP – gather_test_decisions
+# ----------------------------------------------------------------------
+@torch.no_grad()
+def gather_test_decisions(
+        test_loader,
+        local_feature_extractor,
+        local_classifier,
+        cloud_cnn,
+        deep_offload_model,
+        *,
+        b_star: float,
+        entropy_threshold: float,
+        device: str = 'cuda',
+        input_mode: str = 'logits'
+    ) -> Tuple[np.ndarray, Dict[str, np.ndarray], List[int]]:
+    """
+    ------------------------------------------------------------------
+    Runs **one** forward pass over the test_loader and collects:
+
+      • bk values  (one per sample) – “difference in confidence” metric
+        as used by the DDNN offloading papers.
+
+      • Decisions from three rules:
+        Oracle         – optimal rule relying on true labels.
+        Deep-offload   – your trained offloading NN (logits → σ → 0/1).
+        Entropy        – simple threshold on the local output entropy.
+
+    The function is careful to stay in *eval* mode and preserve current
+    `torch.no_grad()` context so it adds zero overhead to your training
+    script.
+
+    Parameters
+    ----------
+    test_loader
+        A PyTorch DataLoader yielding **(images, labels)**.
+    local_feature_extractor
+        Trunk CNN running on device for local inference (produces feature maps).
+    local_classifier
+        Small head that turns local features into class logits.
+    cloud_cnn
+        Remote CNN that also takes local features and outputs class logits.
+    deep_offload_model
+        The learned decision network (e.g. an MLP) which outputs a single
+        logit indicating *cloud vs local*.
+    b_star
+        Threshold on bk used by the oracle rule.
+    entropy_threshold
+        If the *normalized entropy* of local logits exceeds this value
+        ⇒ offload to cloud.
+    device
+        'cuda' or 'cpu' – ALL tensors are moved here before forward pass.
+    input_mode
+        What you feed into `deep_offload_model`:
+        • 'logits'       : raw local logits  (default & simplest).
+        • 'feat'         : local feature maps (the high-dim tensor).
+        • 'logits_plus'  : concatenates logits + margin + entropy.
+
+    Returns
+    -------
+    bk_vals
+        NumPy array shape (N,) with bk for each test sample.
+    decisions_dict
+        Dict with keys {'Oracle','Deep-offload','Entropy'}, each value
+        a NumPy array shape (N,) of 0/1 decisions.
+    img_indices
+        List of int indices (0…N-1) mapping directly back to your
+        test_loader order.  Replace with filenames if you prefer.
+
+    Notes
+    -----
+    • If you need the *same local/cloud ratio* across rules, use the
+      resulting decisions to estimate the desired percentage and adjust
+      `entropy_threshold` accordingly in a second pass.
+    • The code assumes that *local_feature_extractor* is frozen and both
+      classifiers operate on the SAME feature tensor to avoid redundant
+      GPU computation.
+    ------------------------------------------------------------------
+    """
+    # Put every sub-module in evaluation mode
+    local_feature_extractor.eval()
+    local_classifier.eval()
+    cloud_cnn.eval()
+    deep_offload_model.eval()
+
+    # Lists will be concatenated at the end (avoids expensive realloc)
+    bk_vals, dec_or, dec_deep, dec_ent, img_ids = [], [], [], [], []
+    idx_global = 0  # running counter to assign unique indices
+
+    for images, labels in test_loader:
+        bs = images.size(0)                              # mini-batch size
+        images, labels = images.to(device), labels.to(device)
+
+        # --------------------------------------------------------------
+        # Forward pass (local & cloud)
+        # --------------------------------------------------------------
+        features     = local_feature_extractor(images)   # shared trunk
+        logits_local = local_classifier(features)        # local decision
+        logits_cloud = cloud_cnn(features)               # remote decision
+
+        # --------------------------------------------------------------
+        # bk computation (lower bk → better local)
+        # --------------------------------------------------------------
+        p_loc = torch.softmax(logits_local, 1)[range(bs), labels]
+        p_cld = torch.softmax(logits_cloud, 1)[range(bs), labels]
+        bk    = (1 - p_loc) - (1 - p_cld)                # ∆ loss wrt ideal
+        bk_vals.append(bk.cpu())
+
+        # --------------------------------------------------------------
+        # Oracle decision (needs true labels)
+        # --------------------------------------------------------------
+        dec_oracle_batch = my_oracle_decision_function(
+                                logits_local, logits_cloud, labels,
+                                b_star=b_star)
+        dec_or.append(dec_oracle_batch.cpu())
+
+        # --------------------------------------------------------------
+        # Deep-offload decision (learned rule)
+        # --------------------------------------------------------------
+        if input_mode == 'logits':
+            dom_input = logits_local.detach()
+        elif input_mode == 'feat':
+            dom_input = features.detach()
+        elif input_mode == 'logits_plus':
+            probs   = torch.softmax(logits_local, 1)
+            top2    = torch.topk(probs, 2).values
+            margin  = top2[:, 0] - top2[:, 1]            # confidence gap
+            entropy_n = (-(probs*torch.log(probs + 1e-9)).sum(1) /
+                         math.log(probs.size(1)))         # normalised entropy
+            dom_input = torch.cat([logits_local,
+                                   margin.unsqueeze(1),
+                                   entropy_n.unsqueeze(1)], dim=1)
+        else:
+            raise ValueError("input_mode must be 'logits'|'feat'|'logits_plus'")
+
+        logits_dec = deep_offload_model(dom_input)       # (bs, 1)
+        dec_batch  = (torch.sigmoid(logits_dec).squeeze(1) > 0.5).float()
+        dec_deep.append(dec_batch.cpu())
+
+        # --------------------------------------------------------------
+        # Entropy decision (hand-crafted rule)
+        # --------------------------------------------------------------
+        probs_local = torch.softmax(logits_local, 1)
+        entropy_raw = -(probs_local * torch.log(probs_local + 1e-9)).sum(1)
+        entropy_n   = entropy_raw / math.log(probs_local.size(1))
+        dec_ent_batch = (entropy_n > entropy_threshold).float()
+        dec_ent.append(dec_ent_batch.cpu())
+
+        # --------------------------------------------------------------
+        # Book-keeping: global index or filename
+        # --------------------------------------------------------------
+        img_ids.extend(range(idx_global, idx_global + bs))
+        idx_global += bs
+
+    # ------------------------------------------------------------------
+    # Concatenate lists into flat NumPy arrays
+    # ------------------------------------------------------------------
+    bk_vals = torch.cat(bk_vals).numpy()
+    decisions_dict = {
+        'Oracle'      : torch.cat(dec_or).numpy(),
+        'Deep-offload': torch.cat(dec_deep).numpy(),
+        'Entropy'     : torch.cat(dec_ent).numpy()
+    }
+    return bk_vals, decisions_dict, img_ids
 
 
 def main(epochs_DDNN=  30,epochs_optimization=50, batch_size=256 , L0=0.54 , local_weight=0.7):
@@ -3905,6 +4231,31 @@ def main(epochs_DDNN=  30,epochs_optimization=50, batch_size=256 , L0=0.54 , loc
             cloud_cnn,
             test_loader,
             b_star,input_mode=input_mode)
+    
+    
+    bk_vals, decisions, img_ids = gather_test_decisions(
+        test_loader,
+        local_feature_extractor,
+        local_classifier,
+        cloud_cnn,
+        deep_offload_model,
+        b_star=b_star,
+        entropy_threshold=entropy_threshold,
+        device=device,
+        input_mode=input_mode
+    )
+
+    # --------------------------------------------------------------
+    # 3) Visualise disagreement and save plot
+    # --------------------------------------------------------------
+    fig, mismatch_idx = plot_decision_comparison(
+        bk_vals,
+        decisions,
+        b_star=b_star,
+        show_all=False,      # set True to overlay fully-agreed samples
+        sample_ids=img_ids
+    )
+    fig.savefig("decision_comparison.svg", bbox_inches="tight")
 
     # print(f"DDNN overall accuracy with clean‑trained DOM: {ddnn_acc:.2f}% "
     #     f"(local%={local_percentage:.1f})")
