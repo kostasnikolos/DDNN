@@ -1,7 +1,7 @@
 # Distributed Deep Neural Network (DDNN) with Intelligent Offloading
 
 ## Project Overview
-This project implements a Distributed Deep Neural Network system for image classification with an intelligent offloading mechanism. The system consists of a local (edge) component and a cloud component, with an adaptive deep learning-based offloading mechanism to optimize computational resource usage and classification accuracy.
+This project implements a Distributed Deep Neural Network system for image classification with an optimized offloading mechanism. The system consists of a local (edge) component and a cloud component, with a deep learning-based offloading mechanism to optimize computational resource usage and classification accuracy.
 
 ## Key Components
 
