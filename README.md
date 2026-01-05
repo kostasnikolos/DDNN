@@ -74,7 +74,7 @@ python scripts/main.py --mode load --dataset cifar10 --testing_mode timing
 #### Main Arguments
 - `--mode`: Execution mode (default: `train`)
   - `train`: Train DDNN from scratch, then run experiments
-  - `load`: **Use only if** you have pretrained DDNN models (from a previous run with the **same dataset and parameters**, or downloaded from GitHub)
+  - `load`: **Use only if** you have pretrained DDNN models (from a previous run with the **same dataset and parameters**)
   
 - `--dataset`: Dataset selection
   - `cifar10`: CIFAR-10 (10 classes, baseline)
@@ -84,7 +84,7 @@ python scripts/main.py --mode load --dataset cifar10 --testing_mode timing
   - `gtsrb32`: German Traffic Sign Recognition (43 classes)
 
 - `--testing_mode`: Type of experiment to run
-  - `offload_mechanism` (default): Test offload decisions across multiple L0 values
+  - `offload_mechanism` (default): Test  DDNNs perfomance using the optimized offloading mechanism
   - `timing`: Inference time benchmarking
   - `border_noisy`: Misclassification analysis (border/noisy samples)
   - `overfitting`: Train/validation accuracy tracking
