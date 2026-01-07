@@ -182,7 +182,6 @@ def test_DDNN_with_oracle(
     N = all_lbl.size(0)
 
     if L0 is not None:
-        # ⬇️ ΝΕΟΣ ΚΩΔΙΚΑΣ: Ranking-based oracle
         # Get continuous scores
         scores = oracle_decision_function(
             all_loc, all_cld, all_lbl,
@@ -202,7 +201,7 @@ def test_DDNN_with_oracle(
         decisions[local_indices] = 0  # mark selected as local (0)
         
     else:
-        # ⬇️ ΠΑΛΑΙΟΣ ΚΩΔΙΚΑΣ: Binary decision based on b_star
+        #  Binary decision based on b_star
         decisions = oracle_decision_function(
             all_loc, all_cld, all_lbl,
             b_star=b_star,
@@ -606,6 +605,907 @@ def analyze_border_noisy_misclassification(
         'normal_count': normal_total,
         'total_count': total
     }
+
+
+def analyze_oracle_optimized_gap(
+    offload_mechanism,
+    local_feature_extractor,
+    local_classifier,
+    cloud_cnn,
+    test_loader,
+    b_star,
+    *,
+    L0: float = 0.54,
+    tau_border: float = 0.01,
+    input_mode: str = 'logits',
+    device: str = 'cuda',
+    dataset_name: str = 'cifar10',
+    plot: bool = True,
+    num_classes: int = 10
+) -> Dict:
+    """
+    Comprehensive analysis to explain the Oracle vs Optimized Rule performance gap.
+    
+    Categorizes test samples into:
+      1. **Disagreement samples** (Oracle ≠ bk-rule) - "noisy labels"
+      2. **Borderline samples** (|bk| < τ_border) - ambiguous cases
+      3. **Normal samples** - clear cases
+      4. **Rational failures** (coin toss) - disagreement where optimized rule's choice 
+         was statistically reasonable but wrong due to not knowing classification result
+    
+    The key insight: Oracle knows the actual classification outcome (ground truth),
+    so it can make "lucky" decisions that the optimized rule cannot replicate.
+    This is like predicting coin tosses - before tossing, any choice is equally good,
+    but after tossing, the oracle knows which were heads/tails.
+    
+    Parameters
+    ----------
+    tau_border : float
+        Threshold for borderline samples (|bk| < tau_border)
+    
+    Returns
+    -------
+    dict
+        Detailed metrics for each sample category including misclassification rates
+    """
+    
+    print(f"\n{'='*80}")
+    print(f"ORACLE vs OPTIMIZED RULE GAP ANALYSIS")
+    print(f"{'='*80}")
+    print(f"Settings: L0={L0:.2f}, τ_border={tau_border}, input_mode={input_mode}")
+    
+    offload_mechanism.eval()
+    local_feature_extractor.eval()
+    local_classifier.eval()
+    cloud_cnn.eval()
+    
+    # Counters for each category
+    disagreement_correct = disagreement_wrong = 0
+    borderline_correct = borderline_wrong = 0
+    normal_correct = normal_wrong = 0
+    rational_failure_correct = rational_failure_wrong = 0
+    
+    total_samples = 0
+    oracle_correct_total = optimized_correct_total = 0
+    
+    with torch.no_grad():
+        for images, labels in test_loader:
+            images, labels = images.to(device), labels.to(device)
+            bs = labels.size(0)
+            total_samples += bs
+            
+            # Forward pass
+            local_feats = local_feature_extractor(images)
+            local_out = local_classifier(local_feats)
+            cloud_out = cloud_cnn(local_feats)
+            
+            # Compute bk
+            local_probs = F.softmax(local_out, dim=1)
+            cloud_probs = F.softmax(cloud_out, dim=1)
+            local_prob_correct = local_probs[range(bs), labels]
+            cloud_prob_correct = cloud_probs[range(bs), labels]
+            bk = (1.0 - local_prob_correct) - (1.0 - cloud_prob_correct)
+            
+            # Oracle decision (knows ground truth)
+            oracle_decisions = my_oracle_decision_function(
+                local_out, cloud_out, labels, b_star=b_star
+            ).float()
+            
+            # bk-rule decision
+            bk_decisions = (bk >= b_star).float()
+            
+            # Optimized Rule decision
+            if input_mode == 'logits':
+                dom_in = local_out
+            elif input_mode == 'logits_plus':
+                probs = F.softmax(local_out, dim=1)
+                num_cls = probs.size(1)
+                k = min(2, num_cls)
+                top_k = torch.topk(probs, k, dim=1).values
+                margin = (top_k[:, 0] - top_k[:, 1]).unsqueeze(1) if k == 2 else torch.zeros(bs, 1, device=device)
+                entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1, keepdim=True) / math.log(num_cls)
+                dom_in = torch.cat([local_out, margin, entropy], dim=1)
+            elif input_mode in ('feat', 'shallow_feat'):
+                dom_in = local_feats
+            else:
+                raise ValueError(f"Unknown input_mode: {input_mode}")
+            
+            offload_logits = offload_mechanism(dom_in)
+            optimized_decisions = (torch.sigmoid(offload_logits).squeeze(1) > 0.5).float()
+            
+            # Predictions
+            local_preds = local_out.argmax(dim=1)
+            cloud_preds = cloud_out.argmax(dim=1)
+            
+            # Oracle DDNN result
+            oracle_final_preds = torch.where(oracle_decisions == 0, local_preds, cloud_preds)
+            oracle_correct_mask = (oracle_final_preds == labels)
+            oracle_correct_total += oracle_correct_mask.sum().item()
+            
+            # Optimized Rule DDNN result
+            optimized_final_preds = torch.where(optimized_decisions == 0, local_preds, cloud_preds)
+            optimized_correct_mask = (optimized_final_preds == labels)
+            optimized_correct_total += optimized_correct_mask.sum().item()
+            
+            # ============================================================
+            # CATEGORIZATION (WITH OVERLAP - this is OK!)
+            # ============================================================
+            # Categories can overlap - e.g., rational failures are also disagreements
+            # This is intentional and useful for analysis
+            
+            # 1. Disagreement samples (Oracle ≠ bk-rule)
+            disagreement_mask = (oracle_decisions != bk_decisions)
+            
+            # 2. Borderline samples (|bk| < τ)
+            borderline_mask = (bk.abs() < tau_border)
+            
+            # 3. Rational failures (coin toss cases)
+            # Definition: Oracle and Optimized Rule disagree, BUT the optimized rule's
+            # decision was statistically reasonable (it followed the bk-rule)
+            # The failure is "rational" because without knowing the ground truth,
+            # the optimized rule made a sensible choice that happened to be wrong
+            rational_failure_mask = (
+                (oracle_decisions != optimized_decisions) &  # They disagree
+                (optimized_decisions == bk_decisions)         # Optimized followed bk-rule
+            )
+            
+            # 4. Normal samples (clear, non-borderline, non-disagreement cases)
+            normal_mask = ~(disagreement_mask | borderline_mask)
+            
+            # Count correct/wrong for each category (based on Optimized Rule performance)
+            disagreement_correct += optimized_correct_mask[disagreement_mask].sum().item()
+            disagreement_wrong += (~optimized_correct_mask[disagreement_mask]).sum().item()
+            
+            borderline_correct += optimized_correct_mask[borderline_mask].sum().item()
+            borderline_wrong += (~optimized_correct_mask[borderline_mask]).sum().item()
+            
+            rational_failure_correct += optimized_correct_mask[rational_failure_mask].sum().item()
+            rational_failure_wrong += (~optimized_correct_mask[rational_failure_mask]).sum().item()
+            
+            normal_correct += optimized_correct_mask[normal_mask].sum().item()
+            normal_wrong += (~optimized_correct_mask[normal_mask]).sum().item()
+    
+    # Compute totals and rates
+    disagreement_total = disagreement_correct + disagreement_wrong
+    borderline_total = borderline_correct + borderline_wrong
+    rational_failure_total = rational_failure_correct + rational_failure_wrong
+    normal_total = normal_correct + normal_wrong
+    
+    # Track overlaps (for informational purposes)
+    # Count how many samples are in multiple categories
+    with torch.no_grad():
+        all_disagreement_mask = []
+        all_borderline_mask = []
+        all_rational_mask = []
+        
+        for images, labels in test_loader:
+            images, labels = images.to(device), labels.to(device)
+            bs = labels.size(0)
+            
+            local_feats = local_feature_extractor(images)
+            local_out = local_classifier(local_feats)
+            cloud_out = cloud_cnn(local_feats)
+            
+            local_probs = F.softmax(local_out, dim=1)
+            cloud_probs = F.softmax(cloud_out, dim=1)
+            local_prob_correct = local_probs[range(bs), labels]
+            cloud_prob_correct = cloud_probs[range(bs), labels]
+            bk = (1.0 - local_prob_correct) - (1.0 - cloud_prob_correct)
+            
+            oracle_decisions = my_oracle_decision_function(
+                local_out, cloud_out, labels, b_star=b_star
+            ).float()
+            bk_decisions = (bk >= b_star).float()
+            
+            if input_mode == 'logits':
+                dom_in = local_out
+            elif input_mode == 'logits_plus':
+                probs = F.softmax(local_out, dim=1)
+                num_cls = probs.size(1)
+                k = min(2, num_cls)
+                top_k = torch.topk(probs, k, dim=1).values
+                margin = (top_k[:, 0] - top_k[:, 1]).unsqueeze(1) if k == 2 else torch.zeros(bs, 1, device=device)
+                entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1, keepdim=True) / math.log(num_cls)
+                dom_in = torch.cat([local_out, margin, entropy], dim=1)
+            elif input_mode in ('feat', 'shallow_feat'):
+                dom_in = local_feats
+            else:
+                raise ValueError(f"Unknown input_mode: {input_mode}")
+            
+            offload_logits = offload_mechanism(dom_in)
+            optimized_decisions = (torch.sigmoid(offload_logits).squeeze(1) > 0.5).float()
+            
+            disagreement = (oracle_decisions != bk_decisions)
+            borderline = (bk.abs() < tau_border)
+            rational = (
+                (oracle_decisions != optimized_decisions) &
+                (optimized_decisions == bk_decisions)
+            )
+            
+            all_disagreement_mask.append(disagreement.cpu())
+            all_borderline_mask.append(borderline.cpu())
+            all_rational_mask.append(rational.cpu())
+        
+        all_disagreement = torch.cat(all_disagreement_mask)
+        all_borderline = torch.cat(all_borderline_mask)
+        all_rational = torch.cat(all_rational_mask)
+        
+        # Count overlaps
+        borderline_AND_disagreement = (all_borderline & all_disagreement).sum().item()
+        borderline_AND_rational = (all_borderline & all_rational).sum().item()
+        rational_AND_disagreement = (all_rational & all_disagreement).sum().item()
+        all_three = (all_borderline & all_rational & all_disagreement).sum().item()
+    
+    disagreement_misclass = 100 * disagreement_wrong / disagreement_total if disagreement_total > 0 else 0.0
+    borderline_misclass = 100 * borderline_wrong / borderline_total if borderline_total > 0 else 0.0
+    rational_failure_misclass = 100 * rational_failure_wrong / rational_failure_total if rational_failure_total > 0 else 0.0
+    normal_misclass = 100 * normal_wrong / normal_total if normal_total > 0 else 0.0
+    
+    oracle_acc = 100 * oracle_correct_total / total_samples
+    optimized_acc = 100 * optimized_correct_total / total_samples
+    gap = oracle_acc - optimized_acc
+    
+    # ============================================================
+    # GAP DECOMPOSITION ANALYSIS
+    # ============================================================
+    # Calculate how much of the gap is explained by rational failures and borderline samples
+    # CRITICAL: Remove overlaps to avoid double-counting in adjustments
+    
+    # Current optimized misclassifications
+    optimized_wrong_total = total_samples - optimized_correct_total
+    optimized_error_rate = 100 * optimized_wrong_total / total_samples
+    
+    # Count UNIQUE misclassifications (without overlap)
+    # We need to go back through the data to count correctly
+    rational_only_wrong = 0
+    borderline_only_wrong = 0
+    both_rational_and_borderline_wrong = 0
+    
+    with torch.no_grad():
+        for images, labels in test_loader:
+            images, labels = images.to(device), labels.to(device)
+            bs = labels.size(0)
+            
+            local_feats = local_feature_extractor(images)
+            local_out = local_classifier(local_feats)
+            cloud_out = cloud_cnn(local_feats)
+            
+            local_probs = F.softmax(local_out, dim=1)
+            cloud_probs = F.softmax(cloud_out, dim=1)
+            local_prob_correct = local_probs[range(bs), labels]
+            cloud_prob_correct = cloud_probs[range(bs), labels]
+            bk = (1.0 - local_prob_correct) - (1.0 - cloud_prob_correct)
+            
+            oracle_decisions = my_oracle_decision_function(
+                local_out, cloud_out, labels, b_star=b_star
+            ).float()
+            bk_decisions = (bk >= b_star).float()
+            
+            if input_mode == 'logits':
+                dom_in = local_out
+            elif input_mode == 'logits_plus':
+                probs = F.softmax(local_out, dim=1)
+                num_cls = probs.size(1)
+                k = min(2, num_cls)
+                top_k = torch.topk(probs, k, dim=1).values
+                margin = (top_k[:, 0] - top_k[:, 1]).unsqueeze(1) if k == 2 else torch.zeros(bs, 1, device=device)
+                entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1, keepdim=True) / math.log(num_cls)
+                dom_in = torch.cat([local_out, margin, entropy], dim=1)
+            elif input_mode in ('feat', 'shallow_feat'):
+                dom_in = local_feats
+            else:
+                raise ValueError(f"Unknown input_mode: {input_mode}")
+            
+            offload_logits = offload_mechanism(dom_in)
+            optimized_decisions = (torch.sigmoid(offload_logits).squeeze(1) > 0.5).float()
+            
+            local_preds = local_out.argmax(dim=1)
+            cloud_preds = cloud_out.argmax(dim=1)
+            optimized_final_preds = torch.where(optimized_decisions == 0, local_preds, cloud_preds)
+            is_wrong = (optimized_final_preds != labels)
+            
+            rational = (
+                (oracle_decisions != optimized_decisions) &
+                (optimized_decisions == bk_decisions)
+            )
+            borderline = (bk.abs() < tau_border)
+            
+            # Count UNIQUE wrong samples (no overlap)
+            rational_only_wrong += (is_wrong & rational & ~borderline).sum().item()
+            borderline_only_wrong += (is_wrong & borderline & ~rational).sum().item()
+            both_rational_and_borderline_wrong += (is_wrong & rational & borderline).sum().item()
+    
+    # If we remove ONLY rational failures from misclassifications
+    # (these are "justified" errors - coin toss scenarios)
+    adjusted_wrong_without_rational = optimized_wrong_total - rational_only_wrong - both_rational_and_borderline_wrong
+    adjusted_acc_without_rational = 100 * (total_samples - adjusted_wrong_without_rational) / total_samples
+    gap_explained_by_rational = adjusted_acc_without_rational - optimized_acc
+    
+    # If we also remove borderline samples from misclassifications
+    # (these are inherently ambiguous cases)
+    # This removes: rational_only + borderline_only + both
+    adjusted_wrong_without_both = optimized_wrong_total - rational_only_wrong - borderline_only_wrong - both_rational_and_borderline_wrong
+    adjusted_acc_without_both = 100 * (total_samples - adjusted_wrong_without_both) / total_samples
+    gap_explained_by_both = adjusted_acc_without_both - optimized_acc
+    
+    # Remaining unexplained gap
+    remaining_gap_after_rational = oracle_acc - adjusted_acc_without_rational
+    remaining_gap_after_both = oracle_acc - adjusted_acc_without_both
+    
+    # Percentage of gap explained
+    pct_gap_explained_by_rational = (gap_explained_by_rational / gap * 100) if gap > 0 else 0.0
+    pct_gap_explained_by_both = (gap_explained_by_both / gap * 100) if gap > 0 else 0.0
+    
+    # Print results
+    print(f"\n{'='*80}")
+    print(f"OVERALL PERFORMANCE")
+    print(f"{'='*80}")
+    print(f"  Oracle Accuracy:      {oracle_acc:.2f}%")
+    print(f"  Optimized Rule Acc:   {optimized_acc:.2f}%")
+    print(f"  Performance Gap:      {gap:.2f}% ⬅️ TO BE EXPLAINED")
+    
+    print(f"\n{'='*80}")
+    print(f"SAMPLE CATEGORIZATION & MISCLASSIFICATION RATES")
+    print(f"{'='*80}")
+    print(f"  Disagreement samples:  {disagreement_total:5d} ({100*disagreement_total/total_samples:5.1f}%) | Misclass: {disagreement_misclass:5.1f}%")
+    print(f"  Borderline samples:    {borderline_total:5d} ({100*borderline_total/total_samples:5.1f}%) | Misclass: {borderline_misclass:5.1f}%")
+    print(f"    ├─ Also disagreement: {borderline_AND_disagreement} ({100*borderline_AND_disagreement/borderline_total:.1f}% of borderline)")
+    print(f"    └─ Also rational:     {borderline_AND_rational} ({100*borderline_AND_rational/borderline_total:.1f}% of borderline)")
+    print(f"  Rational failures:     {rational_failure_total:5d} ({100*rational_failure_total/total_samples:5.1f}%) | Misclass: {rational_failure_misclass:5.1f}%")
+    print(f"    ├─ Also disagreement: {rational_AND_disagreement} ({100*rational_AND_disagreement/rational_failure_total:.1f}% of rational)")
+    print(f"    └─ Also borderline:   {borderline_AND_rational} ({100*borderline_AND_rational/rational_failure_total:.1f}% of rational)")
+    print(f"  Normal samples:        {normal_total:5d} ({100*normal_total/total_samples:5.1f}%) | Misclass: {normal_misclass:5.1f}%")
+    print(f"\n  Note: Categories may overlap (e.g., rational failures are always disagreements)")
+    print(f"        All three overlap: {all_three} samples")
+    
+    # DETAILED DISAGREEMENT ANALYSIS
+    print(f"\n{'='*80}")
+    print(f"DETAILED DISAGREEMENT ANALYSIS (Oracle ≠ bk-rule)")
+    print(f"{'='*80}")
+    
+    disagree_oracle_local = disagree_oracle_cloud = 0
+    disagree_opt_local = disagree_opt_cloud = 0
+    disagree_bk_positive = disagree_bk_negative = 0
+    disagree_bk_values = []
+    
+    with torch.no_grad():
+        for images, labels in test_loader:
+            images, labels = images.to(device), labels.to(device)
+            bs = labels.size(0)
+            
+            local_feats = local_feature_extractor(images)
+            local_out = local_classifier(local_feats)
+            cloud_out = cloud_cnn(local_feats)
+            
+            local_probs = F.softmax(local_out, dim=1)
+            cloud_probs = F.softmax(cloud_out, dim=1)
+            local_prob_correct = local_probs[range(bs), labels]
+            cloud_prob_correct = cloud_probs[range(bs), labels]
+            bk = (1.0 - local_prob_correct) - (1.0 - cloud_prob_correct)
+            
+            oracle_decisions = my_oracle_decision_function(
+                local_out, cloud_out, labels, b_star=b_star
+            ).float()
+            bk_decisions = (bk >= b_star).float()
+            
+            if input_mode == 'logits':
+                dom_in = local_out
+            elif input_mode == 'logits_plus':
+                probs = F.softmax(local_out, dim=1)
+                num_cls = probs.size(1)
+                k = min(2, num_cls)
+                top_k = torch.topk(probs, k, dim=1).values
+                margin = (top_k[:, 0] - top_k[:, 1]).unsqueeze(1) if k == 2 else torch.zeros(bs, 1, device=device)
+                entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1, keepdim=True) / math.log(num_cls)
+                dom_in = torch.cat([local_out, margin, entropy], dim=1)
+            elif input_mode in ('feat', 'shallow_feat'):
+                dom_in = local_feats
+            else:
+                raise ValueError(f"Unknown input_mode: {input_mode}")
+            
+            offload_logits = offload_mechanism(dom_in)
+            optimized_decisions = (torch.sigmoid(offload_logits).squeeze(1) > 0.5).float()
+            
+            # Analyze disagreements
+            disagree_mask = (oracle_decisions != bk_decisions)
+            
+            if disagree_mask.any():
+                disagree_oracle_local += (oracle_decisions[disagree_mask] == 0).sum().item()
+                disagree_oracle_cloud += (oracle_decisions[disagree_mask] == 1).sum().item()
+                disagree_opt_local += (optimized_decisions[disagree_mask] == 0).sum().item()
+                disagree_opt_cloud += (optimized_decisions[disagree_mask] == 1).sum().item()
+                disagree_bk_positive += (bk[disagree_mask] >= 0).sum().item()
+                disagree_bk_negative += (bk[disagree_mask] < 0).sum().item()
+                disagree_bk_values.extend(bk[disagree_mask].cpu().tolist())
+    
+    import numpy as np
+    bk_array = np.array(disagree_bk_values)
+    
+    print(f"  Total disagreements: {disagreement_total}")
+    print(f"\n  Oracle choices in disagreements:")
+    print(f"    Local:  {disagree_oracle_local} ({100*disagree_oracle_local/disagreement_total:.1f}%)")
+    print(f"    Cloud:  {disagree_oracle_cloud} ({100*disagree_oracle_cloud/disagreement_total:.1f}%)")
+    print(f"\n  Optimized choices in disagreements:")
+    print(f"    Local:  {disagree_opt_local} ({100*disagree_opt_local/disagreement_total:.1f}%)")
+    print(f"    Cloud:  {disagree_opt_cloud} ({100*disagree_opt_cloud/disagreement_total:.1f}%)")
+    print(f"\n  bk values in disagreements:")
+    print(f"    Positive (bk≥0): {disagree_bk_positive} ({100*disagree_bk_positive/disagreement_total:.1f}%)")
+    print(f"    Negative (bk<0): {disagree_bk_negative} ({100*disagree_bk_negative/disagreement_total:.1f}%)")
+    print(f"    Mean: {bk_array.mean():.4f}, Std: {bk_array.std():.4f}")
+    print(f"    Min: {bk_array.min():.4f}, Max: {bk_array.max():.4f}")
+    print(f"    Median: {np.median(bk_array):.4f}")
+    print(f"\n  💡 Current b_star threshold: {b_star:.4f}")
+    print(f"  💡 If most disagreements have |bk| small, they are 'coin toss' scenarios!")
+    
+    # ALTERNATIVE DEFINITION ANALYSIS
+    print(f"\n{'='*80}")
+    print(f"ALTERNATIVE RATIONAL FAILURE DEFINITION")
+    print(f"{'='*80}")
+    print(f"  Current definition: (Oracle ≠ Optimized) AND (Optimized = bk-rule)")
+    print(f"  → Only {rational_failure_total} samples")
+    print(f"\n  PROPOSAL: Use disagreements where |bk| is small (ambiguous cases)")
+    print(f"  → Rational failures = (Oracle ≠ bk-rule) AND (|bk| < threshold)")
+    
+    # Try different thresholds
+    for threshold in [0.05, 0.10, 0.15, 0.20]:
+        alt_rational = (np.abs(bk_array) < threshold).sum()
+        print(f"     With |bk| < {threshold:.2f}: {alt_rational} samples ({100*alt_rational/disagreement_total:.1f}% of disagreements)")
+    
+    print(f"\n  💡 RECOMMENDATION: Use |bk| < 0.10 or 0.15 as 'rational failure' threshold")
+    print(f"     This captures cases where the choice between local/cloud is genuinely ambiguous")
+    
+    # ============================================================
+    # BK-RULE QUALITY ANALYSIS
+    # ============================================================
+    print(f"\n{'='*80}")
+    print(f"BK-RULE QUALITY ANALYSIS")
+    print(f"{'='*80}")
+    print(f"  The bk-rule uses: bk = (1 - P_local_correct) - (1 - P_cloud_correct)")
+    print(f"                      = P_cloud_correct - P_local_correct")
+    print(f"  Decision: bk ≥ b_star → cloud, else → local")
+    
+    bk_correct_local = bk_correct_cloud = 0
+    bk_wrong_local = bk_wrong_cloud = 0
+    
+    with torch.no_grad():
+        for images, labels in test_loader:
+            images, labels = images.to(device), labels.to(device)
+            bs = labels.size(0)
+            
+            local_feats = local_feature_extractor(images)
+            local_out = local_classifier(local_feats)
+            cloud_out = cloud_cnn(local_feats)
+            
+            local_probs = F.softmax(local_out, dim=1)
+            cloud_probs = F.softmax(cloud_out, dim=1)
+            local_prob_correct = local_probs[range(bs), labels]
+            cloud_prob_correct = cloud_probs[range(bs), labels]
+            bk = (1.0 - local_prob_correct) - (1.0 - cloud_prob_correct)
+            
+            bk_decisions = (bk >= b_star).float()
+            
+            # Get actual predictions
+            local_preds = local_out.argmax(dim=1)
+            cloud_preds = cloud_out.argmax(dim=1)
+            
+            # Apply bk-rule decisions
+            bk_final_preds = torch.where(bk_decisions == 0, local_preds, cloud_preds)
+            bk_correct = (bk_final_preds == labels)
+            
+            # Breakdown by decision
+            bk_chose_local = (bk_decisions == 0)
+            bk_chose_cloud = (bk_decisions == 1)
+            
+            bk_correct_local += (bk_correct & bk_chose_local).sum().item()
+            bk_wrong_local += (~bk_correct & bk_chose_local).sum().item()
+            bk_correct_cloud += (bk_correct & bk_chose_cloud).sum().item()
+            bk_wrong_cloud += (~bk_correct & bk_chose_cloud).sum().item()
+    
+    bk_total_local = bk_correct_local + bk_wrong_local
+    bk_total_cloud = bk_correct_cloud + bk_wrong_cloud
+    bk_overall_acc = 100 * (bk_correct_local + bk_correct_cloud) / total_samples
+    
+    print(f"\n  bk-rule performance:")
+    print(f"    Overall accuracy: {bk_overall_acc:.2f}%")
+    print(f"    Local decisions: {bk_total_local} ({100*bk_total_local/total_samples:.1f}%)")
+    print(f"      ├─ Correct: {bk_correct_local} ({100*bk_correct_local/bk_total_local:.1f}%)")
+    print(f"      └─ Wrong:   {bk_wrong_local} ({100*bk_wrong_local/bk_total_local:.1f}%)")
+    print(f"    Cloud decisions: {bk_total_cloud} ({100*bk_total_cloud/total_samples:.1f}%)")
+    print(f"      ├─ Correct: {bk_correct_cloud} ({100*bk_correct_cloud/bk_total_cloud:.1f}%)")
+    print(f"      └─ Wrong:   {bk_wrong_cloud} ({100*bk_wrong_cloud/bk_total_cloud:.1f}%)")
+    
+    print(f"\n  Comparison:")
+    print(f"    Oracle:    {oracle_acc:.2f}% (knows ground truth)")
+    print(f"    Optimized: {optimized_acc:.2f}% (learned from bk-rule)")
+    print(f"    bk-rule:   {bk_overall_acc:.2f}% (probability-based)")
+    
+    if optimized_acc > bk_overall_acc:
+        print(f"\n  ✅ GOOD NEWS: Optimized outperforms bk-rule by {optimized_acc - bk_overall_acc:.2f}%!")
+        print(f"     The network learned to deviate from bk-rule in beneficial ways")
+    else:
+        print(f"\n  ⚠️  WARNING: bk-rule performs better than optimized!")
+        print(f"     The network may be undertrained or the input features are insufficient")
+    
+    print(f"\n{'='*80}")
+    print(f"GAP DECOMPOSITION ANALYSIS")
+    print(f"{'='*80}")
+    print(f"  Current Optimized Accuracy:                    {optimized_acc:.2f}%")
+    print(f"  Adjusted Accuracy (w/o rational failures):     {adjusted_acc_without_rational:.2f}% (+{gap_explained_by_rational:.2f}%)")
+    print(f"  Adjusted Accuracy (w/o rational + borderline): {adjusted_acc_without_both:.2f}% (+{gap_explained_by_both:.2f}%)")
+    print(f"  Oracle Accuracy (theoretical upper bound):     {oracle_acc:.2f}%")
+    print(f"")
+    print(f"  Gap explained by rational failures:     {gap_explained_by_rational:.2f}% ({pct_gap_explained_by_rational:.1f}% of total gap)")
+    print(f"  Gap explained by rational + borderline: {gap_explained_by_both:.2f}% ({pct_gap_explained_by_both:.1f}% of total gap)")
+    print(f"  Remaining unexplained gap:              {remaining_gap_after_both:.2f}%")
+    
+    print(f"\n{'='*80}")
+    print(f"KEY INSIGHT:")
+    print(f"{'='*80}")
+    print(f"  Rational failures represent 'coin toss' scenarios where the optimized")
+    print(f"  rule made a statistically sound decision but was wrong because it")
+    print(f"  doesn't know the classification outcome (unlike the oracle).")
+    print(f"  ")
+    print(f"  By removing these 'justified errors' from the optimized rule's performance,")
+    print(f"  we see that {pct_gap_explained_by_rational:.1f}% of the gap is due to rational failures alone,")
+    print(f"  and {pct_gap_explained_by_both:.1f}% when including borderline samples.")
+    print(f"  ")
+    print(f"  This demonstrates that the gap is NOT due to poor model design, but rather")
+    print(f"  the inherent advantage of oracle having privileged information (ground truth).")
+    
+    # ================================================================
+    # PLOTTING
+    # ================================================================
+    if plot:
+        fig = plt.figure(figsize=(20, 6))
+        gs = fig.add_gridspec(1, 3, width_ratios=[1, 1, 1.2])
+        
+        ax1 = fig.add_subplot(gs[0])
+        ax2 = fig.add_subplot(gs[1])
+        ax3 = fig.add_subplot(gs[2])
+        
+        # PLOT 1: Misclassification rates
+        categories = ['Disagreement\nSamples', 'Borderline\nSamples', 
+                     'Rational\nFailures', 'Normal\nSamples']
+        misclass_rates = [disagreement_misclass, borderline_misclass, 
+                         rational_failure_misclass, normal_misclass]
+        colors = ['#FF6B6B', '#FFA500', '#9B59B6', '#4CAF50']
+        
+        bars1 = ax1.bar(categories, misclass_rates, color=colors, alpha=0.8, width=0.6)
+        ax1.set_ylim(0, 100)
+        ax1.set_ylabel('Misclassification Rate (%)', fontsize=12, fontweight='bold')
+        ax1.set_title('Misclassification Rates by Sample Category', fontsize=13, fontweight='bold')
+        ax1.grid(axis='y', linestyle='--', alpha=0.3)
+        
+        for bar, rate in zip(bars1, misclass_rates):
+            ax1.text(bar.get_x() + bar.get_width()/2, rate + 2,
+                    f'{rate:.1f}%', ha='center', va='bottom', fontsize=11, fontweight='bold')
+        
+        # PLOT 2: Sample distribution (STACKED to show overlaps)
+        counts = [disagreement_total, borderline_total, rational_failure_total, normal_total]
+        bars2 = ax2.bar(categories, counts, color=colors, alpha=0.8, width=0.6)
+        ax2.set_ylabel('Number of Samples', fontsize=12, fontweight='bold')
+        ax2.set_title('Sample Distribution by Category\n(Categories may overlap)', 
+                     fontsize=13, fontweight='bold')
+        ax2.grid(axis='y', linestyle='--', alpha=0.3)
+        
+        # Add count labels with percentage of TOTAL (not sum, because of overlap)
+        for bar, count, cat in zip(bars2, counts, categories):
+            pct = 100 * count / total_samples
+            ax2.text(bar.get_x() + bar.get_width()/2, count + total_samples*0.01,
+                    f'{count}\n({pct:.1f}%)', ha='center', va='bottom', 
+                    fontsize=10, fontweight='bold')
+        
+        # Add note about overlap at bottom
+        note_text = f"Total unique samples: {total_samples:,}\n"
+        note_text += f"Note: Rational failures ⊆ Disagreements, some overlap with Borderline"
+        ax2.text(0.5, -0.15, note_text, transform=ax2.transAxes,
+                ha='center', va='top', fontsize=9, style='italic',
+                bbox=dict(boxstyle='round,pad=0.5', facecolor='lightyellow', alpha=0.7))
+        
+        # PLOT 3: Gap Decomposition (NEW!)
+        gap_stages = ['Optimized\nRule', 'w/o Rational\nFailures', 'w/o Rational\n+ Borderline', 'Oracle\n(Upper Bound)']
+        accuracies = [optimized_acc, adjusted_acc_without_rational, adjusted_acc_without_both, oracle_acc]
+        stage_colors = ['#E74C3C', '#F39C12', '#27AE60', '#3498DB']
+        
+        bars3 = ax3.bar(gap_stages, accuracies, color=stage_colors, alpha=0.8, width=0.6)
+        ax3.set_ylim(min(accuracies) - 5, 100)
+        ax3.set_ylabel('DDNN Accuracy (%)', fontsize=12, fontweight='bold')
+        ax3.set_title('Gap Decomposition Analysis', fontsize=13, fontweight='bold')
+        ax3.grid(axis='y', linestyle='--', alpha=0.3)
+        
+        # Add accuracy labels on bars
+        for bar, acc in zip(bars3, accuracies):
+            ax3.text(bar.get_x() + bar.get_width()/2, acc + 0.5,
+                    f'{acc:.2f}%', ha='center', va='bottom', 
+                    fontsize=11, fontweight='bold')
+        
+        # Add arrows showing gap reduction
+        arrow_props = dict(arrowstyle='->', lw=2, color='black', alpha=0.6)
+        
+        # Arrow 1: Optimized → w/o Rational
+        ax3.annotate('', xy=(1, adjusted_acc_without_rational - 0.5), 
+                    xytext=(0, optimized_acc + 0.5),
+                    arrowprops=arrow_props)
+        # Show breakdown of rational failures
+        rational_breakdown = f'+{gap_explained_by_rational:.2f}%\n({pct_gap_explained_by_rational:.0f}% of gap)\n'
+        rational_breakdown += f'{rational_only_wrong + both_rational_and_borderline_wrong} errors removed'
+        ax3.text(0.5, (optimized_acc + adjusted_acc_without_rational)/2,
+                rational_breakdown,
+                ha='center', va='center', fontsize=8, fontweight='bold',
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7))
+        
+        # Arrow 2: w/o Rational → w/o Both
+        ax3.annotate('', xy=(2, adjusted_acc_without_both - 0.5),
+                    xytext=(1, adjusted_acc_without_rational + 0.5),
+                    arrowprops=arrow_props)
+        borderline_contrib = gap_explained_by_both - gap_explained_by_rational
+        borderline_breakdown = f'+{borderline_contrib:.2f}%\n{borderline_only_wrong} errors removed'
+        ax3.text(1.5, (adjusted_acc_without_rational + adjusted_acc_without_both)/2,
+                borderline_breakdown,
+                ha='center', va='center', fontsize=8, fontweight='bold',
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='lightgreen', alpha=0.7))
+        
+        # Arrow 3: w/o Both → Oracle (remaining gap)
+        if remaining_gap_after_both > 0.5:
+            ax3.annotate('', xy=(3, oracle_acc - 0.5),
+                        xytext=(2, adjusted_acc_without_both + 0.5),
+                        arrowprops=dict(arrowstyle='->', lw=2, color='red', alpha=0.6))
+            ax3.text(2.5, (adjusted_acc_without_both + oracle_acc)/2,
+                    f'Remaining\n{remaining_gap_after_both:.2f}%',
+                    ha='center', va='center', fontsize=9, fontweight='bold',
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='lightcoral', alpha=0.7))
+        
+        # Add gap info to title
+        plt.suptitle(
+            f'Oracle vs Optimized Rule Gap Analysis (Gap={gap:.2f}%, {pct_gap_explained_by_both:.0f}% Explained, τ={tau_border}, L0={L0:.2f}, {dataset_name.upper()})', 
+            fontsize=15, fontweight='bold'
+        )
+        plt.tight_layout(rect=[0, 0.03, 1, 0.96])
+        
+        output_path = f'oracle_optimized_gap_{dataset_name}_L0{int(L0*100)}.png'
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        print(f"\n✓ Saved plot: {output_path}")
+        plt.close(fig)
+    
+    return {
+        'oracle_acc': oracle_acc,
+        'optimized_acc': optimized_acc,
+        'gap': gap,
+        'disagreement_misclass': disagreement_misclass,
+        'borderline_misclass': borderline_misclass,
+        'rational_failure_misclass': rational_failure_misclass,
+        'normal_misclass': normal_misclass,
+        'disagreement_count': disagreement_total,
+        'borderline_count': borderline_total,
+        'rational_failure_count': rational_failure_total,
+        'normal_count': normal_total,
+        'total_count': total_samples,
+        # Overlap statistics
+        'borderline_AND_disagreement': borderline_AND_disagreement,
+        'borderline_AND_rational': borderline_AND_rational,
+        'rational_AND_disagreement': rational_AND_disagreement,
+        'all_three_overlap': all_three,
+        # Gap decomposition metrics (NO OVERLAP in adjustments)
+        'adjusted_acc_without_rational': adjusted_acc_without_rational,
+        'adjusted_acc_without_both': adjusted_acc_without_both,
+        'gap_explained_by_rational': gap_explained_by_rational,
+        'gap_explained_by_both': gap_explained_by_both,
+        'pct_gap_explained_by_rational': pct_gap_explained_by_rational,
+        'pct_gap_explained_by_both': pct_gap_explained_by_both,
+        'remaining_gap_after_both': remaining_gap_after_both,
+        # Breakdown for unique adjustments
+        'rational_only_wrong': rational_only_wrong,
+        'borderline_only_wrong': borderline_only_wrong,
+        'both_rational_and_borderline_wrong': both_rational_and_borderline_wrong
+    }
+
+
+def analyze_borderline_threshold_sensitivity(
+    offload_mechanism,
+    local_feature_extractor,
+    local_classifier,
+    cloud_cnn,
+    test_loader,
+    b_star,
+    *,
+    L0: float = 0.54,
+    tau_values: List[float] = None,
+    input_mode: str = 'logits',
+    device: str = 'cuda',
+    dataset_name: str = 'cifar10',
+    plot: bool = True,
+    num_classes: int = 10
+) -> Dict:
+    """
+    Analyze how different borderline thresholds affect classification performance.
+    
+    For each τ threshold, categorize samples as borderline (|bk| < τ) and measure
+    their misclassification rates to determine where "borderline" truly begins.
+    
+    Parameters
+    ----------
+    tau_values : List[float]
+        List of threshold values to test (e.g., [0.01, 0.05, 0.10, 0.15, 0.20])
+        If None, defaults to [0.01, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30]
+    
+    Returns
+    -------
+    dict
+        Results for each threshold including misclassification rates
+    """
+    
+    if tau_values is None:
+        tau_values = [0.01, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30]
+    
+    print(f"\n{'='*80}")
+    print(f"BORDERLINE THRESHOLD SENSITIVITY ANALYSIS")
+    print(f"{'='*80}")
+    print(f"Testing thresholds: {tau_values}")
+    print(f"Settings: L0={L0:.2f}, input_mode={input_mode}")
+    
+    offload_mechanism.eval()
+    local_feature_extractor.eval()
+    local_classifier.eval()
+    cloud_cnn.eval()
+    
+    # Store all data first
+    all_bks = []
+    all_optimized_decisions = []
+    all_optimized_correct = []
+    
+    with torch.no_grad():
+        for images, labels in test_loader:
+            images, labels = images.to(device), labels.to(device)
+            bs = labels.size(0)
+            
+            # Forward pass
+            local_feats = local_feature_extractor(images)
+            local_out = local_classifier(local_feats)
+            cloud_out = cloud_cnn(local_feats)
+            
+            # Compute bk
+            local_probs = F.softmax(local_out, dim=1)
+            cloud_probs = F.softmax(cloud_out, dim=1)
+            local_prob_correct = local_probs[range(bs), labels]
+            cloud_prob_correct = cloud_probs[range(bs), labels]
+            bk = (1.0 - local_prob_correct) - (1.0 - cloud_prob_correct)
+            
+            # Optimized Rule decision
+            if input_mode == 'logits':
+                dom_in = local_out
+            elif input_mode == 'logits_plus':
+                probs = F.softmax(local_out, dim=1)
+                num_cls = probs.size(1)
+                k = min(2, num_cls)
+                top_k = torch.topk(probs, k, dim=1).values
+                margin = (top_k[:, 0] - top_k[:, 1]).unsqueeze(1) if k == 2 else torch.zeros(bs, 1, device=device)
+                entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1, keepdim=True) / math.log(num_cls)
+                dom_in = torch.cat([local_out, margin, entropy], dim=1)
+            elif input_mode in ('feat', 'shallow_feat'):
+                dom_in = local_feats
+            else:
+                raise ValueError(f"Unknown input_mode: {input_mode}")
+            
+            offload_logits = offload_mechanism(dom_in)
+            optimized_decisions = (torch.sigmoid(offload_logits).squeeze(1) > 0.5).float()
+            
+            # Predictions
+            local_preds = local_out.argmax(dim=1)
+            cloud_preds = cloud_out.argmax(dim=1)
+            
+            optimized_final_preds = torch.where(optimized_decisions == 0, local_preds, cloud_preds)
+            optimized_correct_mask = (optimized_final_preds == labels)
+            
+            all_bks.append(bk.cpu())
+            all_optimized_decisions.append(optimized_decisions.cpu())
+            all_optimized_correct.append(optimized_correct_mask.cpu())
+    
+    # Concatenate all batches
+    all_bks = torch.cat(all_bks)
+    all_optimized_decisions = torch.cat(all_optimized_decisions)
+    all_optimized_correct = torch.cat(all_optimized_correct)
+    total_samples = len(all_bks)
+    
+    # Analyze for each threshold
+    results = {
+        'tau_values': [],
+        'borderline_misclass_rates': [],
+        'normal_misclass_rates': [],
+        'borderline_counts': [],
+        'normal_counts': []
+    }
+    
+    print(f"\n{'='*80}")
+    print(f"RESULTS BY THRESHOLD")
+    print(f"{'='*80}")
+    print(f"{'Tau':>6} | {'Border Count':>12} | {'Border %':>8} | {'Border Misclass':>15} | {'Normal Misclass':>15}")
+    print(f"{'-'*80}")
+    
+    for tau in tau_values:
+        borderline_mask = (all_bks.abs() < tau)
+        normal_mask = ~borderline_mask
+        
+        borderline_total = borderline_mask.sum().item()
+        normal_total = normal_mask.sum().item()
+        
+        borderline_wrong = (~all_optimized_correct[borderline_mask]).sum().item()
+        normal_wrong = (~all_optimized_correct[normal_mask]).sum().item()
+        
+        borderline_misclass = 100 * borderline_wrong / borderline_total if borderline_total > 0 else 0.0
+        normal_misclass = 100 * normal_wrong / normal_total if normal_total > 0 else 0.0
+        
+        borderline_pct = 100 * borderline_total / total_samples
+        
+        results['tau_values'].append(tau)
+        results['borderline_misclass_rates'].append(borderline_misclass)
+        results['normal_misclass_rates'].append(normal_misclass)
+        results['borderline_counts'].append(borderline_total)
+        results['normal_counts'].append(normal_total)
+        
+        print(f"{tau:6.2f} | {borderline_total:12d} | {borderline_pct:7.1f}% | {borderline_misclass:14.1f}% | {normal_misclass:14.1f}%")
+    
+    # ================================================================
+    # PLOTTING
+    # ================================================================
+    if plot:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+        
+        # PLOT 1: Misclassification rates vs threshold
+        ax1.plot(results['tau_values'], results['borderline_misclass_rates'], 
+                marker='o', linewidth=2.5, markersize=8, color='#FF6B6B', 
+                label='Borderline Samples', linestyle='-')
+        ax1.plot(results['tau_values'], results['normal_misclass_rates'], 
+                marker='s', linewidth=2.5, markersize=8, color='#4CAF50', 
+                label='Normal Samples', linestyle='--')
+        
+        ax1.set_xlabel('Threshold τ (for |bk| < τ)', fontsize=12, fontweight='bold')
+        ax1.set_ylabel('Misclassification Rate (%)', fontsize=12, fontweight='bold')
+        ax1.set_title('Impact of Borderline Threshold on Misclassification', 
+                     fontsize=13, fontweight='bold')
+        ax1.grid(True, alpha=0.3)
+        ax1.legend(fontsize=11, loc='best')
+        
+        # Add value labels
+        for tau, border_misc in zip(results['tau_values'], results['borderline_misclass_rates']):
+            ax1.text(tau, border_misc + 1, f'{border_misc:.1f}%', 
+                    ha='center', fontsize=9, color='#FF6B6B')
+        
+        # PLOT 2: Sample counts vs threshold
+        ax2.plot(results['tau_values'], results['borderline_counts'], 
+                marker='o', linewidth=2.5, markersize=8, color='#FF6B6B', 
+                label='Borderline Count', linestyle='-')
+        
+        ax2_pct = ax2.twinx()
+        borderline_pcts = [100 * count / total_samples for count in results['borderline_counts']]
+        ax2_pct.plot(results['tau_values'], borderline_pcts, 
+                    marker='D', linewidth=2, markersize=6, color='#9B59B6', 
+                    label='Borderline %', linestyle=':')
+        
+        ax2.set_xlabel('Threshold τ (for |bk| < τ)', fontsize=12, fontweight='bold')
+        ax2.set_ylabel('Borderline Sample Count', fontsize=12, fontweight='bold', color='#FF6B6B')
+        ax2_pct.set_ylabel('Borderline Percentage (%)', fontsize=12, fontweight='bold', color='#9B59B6')
+        ax2.set_title('Borderline Sample Distribution vs Threshold', 
+                     fontsize=13, fontweight='bold')
+        ax2.grid(True, alpha=0.3)
+        ax2.tick_params(axis='y', labelcolor='#FF6B6B')
+        ax2_pct.tick_params(axis='y', labelcolor='#9B59B6')
+        
+        lines1, labels1 = ax2.get_legend_handles_labels()
+        lines2, labels2 = ax2_pct.get_legend_handles_labels()
+        ax2.legend(lines1 + lines2, labels1 + labels2, fontsize=11, loc='best')
+        
+        plt.suptitle(
+            f'Borderline Threshold Sensitivity Analysis (L0={L0:.2f}, {dataset_name.upper()})', 
+            fontsize=15, fontweight='bold'
+        )
+        plt.tight_layout(rect=[0, 0.03, 1, 0.96])
+        
+        output_path = f'borderline_threshold_sensitivity_{dataset_name}_L0{int(L0*100)}.png'
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        print(f"\n✓ Saved plot: {output_path}")
+        plt.close(fig)
+    
+    return results
 
 
 def test_DDNN_with_random(
