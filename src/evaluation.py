@@ -30,6 +30,61 @@ from src.training import train_deep_offload_mechanism
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
+def compute_logits_with_bk_pred(local_out, local_feats, cloud_predictor, num_classes):
+    """
+    Helper function to compute combined input for logits_with_bk_pred mode.
+    
+    Returns:
+        combined_input: shape (batch, 22) = logits_plus (12) + predicted_bk (10)
+    """
+    # Compute logits_plus
+    probs = F.softmax(local_out, dim=1)
+    top2 = torch.topk(probs, 2, dim=1).values
+    margin = (top2[:, 0] - top2[:, 1]).unsqueeze(1)
+    entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1, keepdim=True) / math.log(num_classes)
+    logits_plus = torch.cat([local_out, margin, entropy], dim=1)  # (batch, 12)
+    
+    # Compute predicted_bk using features + local_logits (or just local_logits if FC-only mode)
+    with torch.no_grad():
+        if hasattr(cloud_predictor, 'logits_only') and cloud_predictor.logits_only:
+            predicted_cloud_logits = cloud_predictor(local_out)  # FC-only mode
+        else:
+            predicted_cloud_logits = cloud_predictor(local_feats, local_out)  # CNN+logits mode
+        predicted_cloud_probs = F.softmax(predicted_cloud_logits, dim=1)
+        local_probs = F.softmax(local_out, dim=1)
+        predicted_bk = predicted_cloud_probs - local_probs  # (batch, 10)
+    
+    # Concatenate
+    combined_input = torch.cat([logits_plus, predicted_bk], dim=1)  # (batch, 22)
+    return combined_input
+
+
+def compute_logits_with_real_bk(local_out, cloud_out, num_classes):
+    """
+    Helper function to compute combined input for logits_with_real_bk mode (TESTING ONLY).
+    Uses REAL cloud logits to compute actual bk.
+    
+    Returns:
+        combined_input: shape (batch, 22) = logits_plus (12) + real_bk (10)
+    """
+    # Compute logits_plus
+    probs = F.softmax(local_out, dim=1)
+    top2 = torch.topk(probs, 2, dim=1).values
+    margin = (top2[:, 0] - top2[:, 1]).unsqueeze(1)
+    entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1, keepdim=True) / math.log(num_classes)
+    logits_plus = torch.cat([local_out, margin, entropy], dim=1)  # (batch, 12)
+    
+    # Compute REAL bk (using actual cloud logits)
+    real_cloud_probs = F.softmax(cloud_out, dim=1)
+    local_probs = F.softmax(local_out, dim=1)
+    real_bk = real_cloud_probs - local_probs  # (batch, 10)
+    
+    # Concatenate
+    combined_input = torch.cat([logits_plus, real_bk], dim=1)  # (batch, 22)
+    return combined_input
+
+
+
 # ============================================================================
 # OFFLOAD MECHANISM EVALUATION
 # ============================================================================
@@ -42,7 +97,9 @@ def evaluate_offload_decision_accuracy_CNN_test(
     test_loader,
     b_star,
     threshold=0.5,
-    *, input_mode='feat', device='cuda'
+    *, input_mode='feat', device='cuda',
+    regression_mode=False,  # ★ NEW: For regression, compare predicted_bk > b_star
+    cloud_predictor=None  # ★ NEW: For logits_with_bk_pred mode
 ):
     """
     Evaluates the offload decisions on test data by comparing:
@@ -109,10 +166,35 @@ def evaluate_offload_decision_accuracy_CNN_test(
                         / math.log(probs.size(1))
                 dom_in = torch.cat([local_out, margin, entropy], dim=1)  # (B,12)
                 logits = offload_mechanism(dom_in)
+            elif input_mode == 'hybrid':
+                # ★ HYBRID mode: logits_plus + compressed features
+                probs = F.softmax(local_out, dim=1)
+                top2  = torch.topk(probs, 2, dim=1).values
+                margin  = (top2[:,0] - top2[:,1]).unsqueeze(1)
+                entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1,keepdim=True) \
+                        / math.log(probs.size(1))
+                dom_in = torch.cat([local_out, margin, entropy], dim=1)  # (B,12)
+                logits = offload_mechanism(dom_in, feat=local_feats)
+            elif input_mode == 'logits_with_bk_pred':
+                # ★ NEW: logits_plus + predicted_bk
+                num_cls = local_out.size(1)
+                combined_input = compute_logits_with_bk_pred(local_out, local_feats, cloud_predictor, num_cls)
+                logits = offload_mechanism(combined_input)
+            elif input_mode == 'logits_with_real_bk':
+                # ★ TESTING: logits_plus + REAL bk
+                num_cls = local_out.size(1)
+                combined_input = compute_logits_with_real_bk(local_out, cloud_out, num_cls)
+                logits = offload_mechanism(combined_input)
             else:
                 raise ValueError(f"Unknown input_mode: {input_mode}")
-            probs = torch.sigmoid(logits).squeeze(1)
-            predicted_label = (probs > threshold).float()
+            
+            # ★ NEW: Regression mode - compare predicted bk with b_star
+            if regression_mode:
+                predicted_bk = logits.squeeze(1)  # Raw bk prediction
+                predicted_label = (predicted_bk >= b_star).float()
+            else:
+                probs = torch.sigmoid(logits).squeeze(1)
+                predicted_label = (probs > threshold).float()
 
             # 5) Compare oracle_labels vs predicted_label
             correct_decisions += (oracle_labels == predicted_label).sum().item()
@@ -225,7 +307,7 @@ def test_DDNN_with_oracle(
 
 
 
-def evaluate_offload_decision_accuracy_CNN_train(loader, local_feature_extractor, local_classifier, cloud_cnn, deep_offload_model, b_star,threshold=0.5, *, input_mode='feat', device='cuda',num_classes=10):
+def evaluate_offload_decision_accuracy_CNN_train(loader, local_feature_extractor, local_classifier, cloud_cnn, deep_offload_model, b_star,threshold=0.5, *, input_mode='feat', device='cuda',num_classes=10, regression_mode=False, cloud_predictor=None):
     """
     Evaluate the offload decision accuracy of the deep offload mechanism on the given dataset.
     This function:
@@ -277,8 +359,22 @@ def evaluate_offload_decision_accuracy_CNN_train(loader, local_feature_extractor
             # if not torch.equal(computed_gt,offload_label): print('Εχουμε θεμα  στην evaluate_offload_decision_train')
             
             # === 3) Δώσε local_feats στο deep_offload_model => offload απόφαση
-            logits_offload = deep_offload_model(x_tensor)
-            pred_offload   = (torch.sigmoid(logits_offload).squeeze(1) > threshold).float()
+            if input_mode == 'hybrid':
+                logits_offload = deep_offload_model(x_tensor, feat=feature_tensor)
+            elif input_mode == 'logits_with_bk_pred':
+                combined_input = compute_logits_with_bk_pred(local_logits, feature_tensor, cloud_predictor, num_classes)
+                logits_offload = deep_offload_model(combined_input)
+            elif input_mode == 'logits_with_real_bk':
+                combined_input = compute_logits_with_real_bk(local_logits, cloud_logits, num_classes)
+                logits_offload = deep_offload_model(combined_input)
+            else:
+                logits_offload = deep_offload_model(x_tensor)
+            
+            # ★ NEW: Regression mode - compare predicted bk with b_star
+            if regression_mode:
+                pred_offload = (logits_offload.squeeze(1) >= b_star).float()
+            else:
+                pred_offload = (torch.sigmoid(logits_offload).squeeze(1) > threshold).float()
 
             # Σύγκρινε pred_offload με computed_gt
             correct_offload += (pred_offload == computed_gt).sum().item()
@@ -470,12 +566,39 @@ def analyze_border_noisy_misclassification(
                 margin = (top_k[:, 0] - top_k[:, 1]).unsqueeze(1) if k == 2 else torch.zeros(bs, 1, device=device)
                 entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1, keepdim=True) / math.log(num_classes)
                 dom_in = torch.cat([local_out, margin, entropy], dim=1)
+            elif input_mode == 'hybrid':
+                probs = F.softmax(local_out, dim=1)
+                num_classes = probs.size(1)
+                k = min(2, num_classes)
+                top_k = torch.topk(probs, k, dim=1).values
+                margin = (top_k[:, 0] - top_k[:, 1]).unsqueeze(1) if k == 2 else torch.zeros(bs, 1, device=device)
+                entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1, keepdim=True) / math.log(num_classes)
+                dom_in = torch.cat([local_out, margin, entropy], dim=1)
+                offload_logits = offload_model(dom_in, feat=local_feats)
+            elif input_mode == 'logits_with_bk_pred':
+                # Use CloudLogitPredictor to predict cloud logits
+                dom_in = compute_logits_with_bk_pred(local_out, local_feats, cloud_predictor, local_out.size(1))
+                offload_logits = offload_model(dom_in)
+            elif input_mode == 'logits_with_real_bk':
+                # Use actual cloud logits for upper bound testing
+                probs = F.softmax(local_out, dim=1)
+                num_cls = probs.size(1)
+                k = min(2, num_cls)
+                top_k = torch.topk(probs, k, dim=1).values
+                margin = (top_k[:, 0] - top_k[:, 1]).unsqueeze(1) if k == 2 else torch.zeros(bs, 1, device=device)
+                entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1, keepdim=True) / math.log(num_cls)
+                logits_plus = torch.cat([local_out, margin, entropy], dim=1)
+                local_probs_bk = F.softmax(local_out, dim=1)
+                cloud_probs_bk = F.softmax(cloud_out, dim=1)
+                real_bk = cloud_probs_bk - local_probs_bk
+                dom_in = torch.cat([logits_plus, real_bk], dim=1)
+                offload_logits = offload_model(dom_in)
             elif input_mode in ('feat', 'shallow_feat'):
                 dom_in = local_feats
+                offload_logits = offload_model(dom_in)
             else:
                 raise ValueError(f"Unknown input_mode: {input_mode}")
             
-            offload_logits = offload_model(dom_in)
             offload_decisions = (torch.sigmoid(offload_logits).squeeze(1) > 0.5).float()
             
             # DDNN prediction
@@ -621,7 +744,9 @@ def analyze_oracle_optimized_gap(
     device: str = 'cuda',
     dataset_name: str = 'cifar10',
     plot: bool = True,
-    num_classes: int = 10
+    num_classes: int = 10,
+    regression_mode: bool = False,  # ★ NEW: For regression, compare predicted_bk > b_star
+    cloud_predictor = None  # ★ NEW: For logits_with_bk_pred mode
 ) -> Dict:
     """
     Comprehensive analysis to explain the Oracle vs Optimized Rule performance gap.
@@ -697,6 +822,7 @@ def analyze_oracle_optimized_gap(
             # Optimized Rule decision
             if input_mode == 'logits':
                 dom_in = local_out
+                offload_logits = offload_mechanism(dom_in)
             elif input_mode == 'logits_plus':
                 probs = F.softmax(local_out, dim=1)
                 num_cls = probs.size(1)
@@ -705,13 +831,38 @@ def analyze_oracle_optimized_gap(
                 margin = (top_k[:, 0] - top_k[:, 1]).unsqueeze(1) if k == 2 else torch.zeros(bs, 1, device=device)
                 entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1, keepdim=True) / math.log(num_cls)
                 dom_in = torch.cat([local_out, margin, entropy], dim=1)
+                offload_logits = offload_mechanism(dom_in)
+            elif input_mode == 'hybrid':
+                # ★ HYBRID mode: logits_plus + compressed features
+                probs = F.softmax(local_out, dim=1)
+                num_cls = probs.size(1)
+                k = min(2, num_cls)
+                top_k = torch.topk(probs, k, dim=1).values
+                margin = (top_k[:, 0] - top_k[:, 1]).unsqueeze(1) if k == 2 else torch.zeros(bs, 1, device=device)
+                entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1, keepdim=True) / math.log(num_cls)
+                dom_in = torch.cat([local_out, margin, entropy], dim=1)
+                offload_logits = offload_mechanism(dom_in, feat=local_feats)
+            elif input_mode == 'logits_with_bk_pred':
+                # ★ NEW: logits_plus + predicted bk from CloudLogitPredictor
+                num_cls = local_out.size(1)
+                dom_in = compute_logits_with_bk_pred(local_out, local_feats, cloud_predictor, num_cls)
+                offload_logits = offload_mechanism(dom_in)
+            elif input_mode == 'logits_with_real_bk':
+                # ★ TESTING: logits_plus + REAL bk (using actual cloud logits)
+                num_cls = local_out.size(1)
+                dom_in = compute_logits_with_real_bk(local_out, cloud_out, num_cls)
+                offload_logits = offload_mechanism(dom_in)
             elif input_mode in ('feat', 'shallow_feat'):
                 dom_in = local_feats
+                offload_logits = offload_mechanism(dom_in)
             else:
                 raise ValueError(f"Unknown input_mode: {input_mode}")
             
-            offload_logits = offload_mechanism(dom_in)
-            optimized_decisions = (torch.sigmoid(offload_logits).squeeze(1) > 0.5).float()
+            # ★ Regression mode - compare predicted bk with b_star
+            if regression_mode:
+                optimized_decisions = (offload_logits.squeeze(1) >= b_star).float()
+            else:
+                optimized_decisions = (torch.sigmoid(offload_logits).squeeze(1) > 0.5).float()
             
             # Predictions
             local_preds = local_out.argmax(dim=1)
@@ -799,6 +950,7 @@ def analyze_oracle_optimized_gap(
             
             if input_mode == 'logits':
                 dom_in = local_out
+                offload_logits = offload_mechanism(dom_in)
             elif input_mode == 'logits_plus':
                 probs = F.softmax(local_out, dim=1)
                 num_cls = probs.size(1)
@@ -807,12 +959,40 @@ def analyze_oracle_optimized_gap(
                 margin = (top_k[:, 0] - top_k[:, 1]).unsqueeze(1) if k == 2 else torch.zeros(bs, 1, device=device)
                 entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1, keepdim=True) / math.log(num_cls)
                 dom_in = torch.cat([local_out, margin, entropy], dim=1)
+                offload_logits = offload_mechanism(dom_in)
+            elif input_mode == 'hybrid':
+                probs = F.softmax(local_out, dim=1)
+                num_cls = probs.size(1)
+                k = min(2, num_cls)
+                top_k = torch.topk(probs, k, dim=1).values
+                margin = (top_k[:, 0] - top_k[:, 1]).unsqueeze(1) if k == 2 else torch.zeros(bs, 1, device=device)
+                entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1, keepdim=True) / math.log(num_cls)
+                dom_in = torch.cat([local_out, margin, entropy], dim=1)
+                offload_logits = offload_mechanism(dom_in, feat=local_feats)
+            elif input_mode == 'logits_with_bk_pred':
+                # Use CloudLogitPredictor to predict cloud logits
+                dom_in = compute_logits_with_bk_pred(local_out, local_feats, cloud_predictor, num_classes)
+                offload_logits = offload_mechanism(dom_in)
+            elif input_mode == 'logits_with_real_bk':
+                # Use actual cloud logits for upper bound testing
+                probs = F.softmax(local_out, dim=1)
+                num_cls = probs.size(1)
+                k = min(2, num_cls)
+                top_k = torch.topk(probs, k, dim=1).values
+                margin = (top_k[:, 0] - top_k[:, 1]).unsqueeze(1) if k == 2 else torch.zeros(bs, 1, device=device)
+                entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1, keepdim=True) / math.log(num_cls)
+                logits_plus = torch.cat([local_out, margin, entropy], dim=1)
+                local_probs_bk = F.softmax(local_out, dim=1)
+                cloud_probs_bk = F.softmax(cloud_out, dim=1)
+                real_bk = cloud_probs_bk - local_probs_bk
+                dom_in = torch.cat([logits_plus, real_bk], dim=1)
+                offload_logits = offload_mechanism(dom_in)
             elif input_mode in ('feat', 'shallow_feat'):
                 dom_in = local_feats
+                offload_logits = offload_mechanism(dom_in)
             else:
                 raise ValueError(f"Unknown input_mode: {input_mode}")
             
-            offload_logits = offload_mechanism(dom_in)
             optimized_decisions = (torch.sigmoid(offload_logits).squeeze(1) > 0.5).float()
             
             disagreement = (oracle_decisions != bk_decisions)
@@ -883,6 +1063,7 @@ def analyze_oracle_optimized_gap(
             
             if input_mode == 'logits':
                 dom_in = local_out
+                offload_logits = offload_mechanism(dom_in)
             elif input_mode == 'logits_plus':
                 probs = F.softmax(local_out, dim=1)
                 num_cls = probs.size(1)
@@ -891,12 +1072,40 @@ def analyze_oracle_optimized_gap(
                 margin = (top_k[:, 0] - top_k[:, 1]).unsqueeze(1) if k == 2 else torch.zeros(bs, 1, device=device)
                 entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1, keepdim=True) / math.log(num_cls)
                 dom_in = torch.cat([local_out, margin, entropy], dim=1)
+                offload_logits = offload_mechanism(dom_in)
+            elif input_mode == 'hybrid':
+                probs = F.softmax(local_out, dim=1)
+                num_cls = probs.size(1)
+                k = min(2, num_cls)
+                top_k = torch.topk(probs, k, dim=1).values
+                margin = (top_k[:, 0] - top_k[:, 1]).unsqueeze(1) if k == 2 else torch.zeros(bs, 1, device=device)
+                entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1, keepdim=True) / math.log(num_cls)
+                dom_in = torch.cat([local_out, margin, entropy], dim=1)
+                offload_logits = offload_mechanism(dom_in, feat=local_feats)
+            elif input_mode == 'logits_with_bk_pred':
+                # Use CloudLogitPredictor to predict cloud logits
+                dom_in = compute_logits_with_bk_pred(local_out, local_feats, cloud_predictor, num_classes)
+                offload_logits = offload_mechanism(dom_in)
+            elif input_mode == 'logits_with_real_bk':
+                # Use actual cloud logits for upper bound testing
+                probs = F.softmax(local_out, dim=1)
+                num_cls = probs.size(1)
+                k = min(2, num_cls)
+                top_k = torch.topk(probs, k, dim=1).values
+                margin = (top_k[:, 0] - top_k[:, 1]).unsqueeze(1) if k == 2 else torch.zeros(bs, 1, device=device)
+                entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1, keepdim=True) / math.log(num_cls)
+                logits_plus = torch.cat([local_out, margin, entropy], dim=1)
+                local_probs_bk = F.softmax(local_out, dim=1)
+                cloud_probs_bk = F.softmax(cloud_out, dim=1)
+                real_bk = cloud_probs_bk - local_probs_bk
+                dom_in = torch.cat([logits_plus, real_bk], dim=1)
+                offload_logits = offload_mechanism(dom_in)
             elif input_mode in ('feat', 'shallow_feat'):
                 dom_in = local_feats
+                offload_logits = offload_mechanism(dom_in)
             else:
                 raise ValueError(f"Unknown input_mode: {input_mode}")
             
-            offload_logits = offload_mechanism(dom_in)
             optimized_decisions = (torch.sigmoid(offload_logits).squeeze(1) > 0.5).float()
             
             local_preds = local_out.argmax(dim=1)
@@ -990,6 +1199,7 @@ def analyze_oracle_optimized_gap(
             
             if input_mode == 'logits':
                 dom_in = local_out
+                offload_logits = offload_mechanism(dom_in)
             elif input_mode == 'logits_plus':
                 probs = F.softmax(local_out, dim=1)
                 num_cls = probs.size(1)
@@ -998,12 +1208,40 @@ def analyze_oracle_optimized_gap(
                 margin = (top_k[:, 0] - top_k[:, 1]).unsqueeze(1) if k == 2 else torch.zeros(bs, 1, device=device)
                 entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1, keepdim=True) / math.log(num_cls)
                 dom_in = torch.cat([local_out, margin, entropy], dim=1)
+                offload_logits = offload_mechanism(dom_in)
+            elif input_mode == 'hybrid':
+                probs = F.softmax(local_out, dim=1)
+                num_cls = probs.size(1)
+                k = min(2, num_cls)
+                top_k = torch.topk(probs, k, dim=1).values
+                margin = (top_k[:, 0] - top_k[:, 1]).unsqueeze(1) if k == 2 else torch.zeros(bs, 1, device=device)
+                entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1, keepdim=True) / math.log(num_cls)
+                dom_in = torch.cat([local_out, margin, entropy], dim=1)
+                offload_logits = offload_mechanism(dom_in, feat=local_feats)
+            elif input_mode == 'logits_with_bk_pred':
+                # Use CloudLogitPredictor to predict cloud logits
+                dom_in = compute_logits_with_bk_pred(local_out, local_feats, cloud_predictor, num_classes)
+                offload_logits = offload_mechanism(dom_in)
+            elif input_mode == 'logits_with_real_bk':
+                # Use actual cloud logits for upper bound testing
+                probs = F.softmax(local_out, dim=1)
+                num_cls = probs.size(1)
+                k = min(2, num_cls)
+                top_k = torch.topk(probs, k, dim=1).values
+                margin = (top_k[:, 0] - top_k[:, 1]).unsqueeze(1) if k == 2 else torch.zeros(bs, 1, device=device)
+                entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1, keepdim=True) / math.log(num_cls)
+                logits_plus = torch.cat([local_out, margin, entropy], dim=1)
+                local_probs_bk = F.softmax(local_out, dim=1)
+                cloud_probs_bk = F.softmax(cloud_out, dim=1)
+                real_bk = cloud_probs_bk - local_probs_bk
+                dom_in = torch.cat([logits_plus, real_bk], dim=1)
+                offload_logits = offload_mechanism(dom_in)
             elif input_mode in ('feat', 'shallow_feat'):
                 dom_in = local_feats
+                offload_logits = offload_mechanism(dom_in)
             else:
                 raise ValueError(f"Unknown input_mode: {input_mode}")
             
-            offload_logits = offload_mechanism(dom_in)
             optimized_decisions = (torch.sigmoid(offload_logits).squeeze(1) > 0.5).float()
             
             # Analyze disagreements
@@ -1314,7 +1552,8 @@ def analyze_borderline_threshold_sensitivity(
     device: str = 'cuda',
     dataset_name: str = 'cifar10',
     plot: bool = True,
-    num_classes: int = 10
+    num_classes: int = 10,
+    regression_mode: bool = False  # ★ NEW: For regression, compare predicted_bk > b_star
 ) -> Dict:
     """
     Analyze how different borderline thresholds affect classification performance.
@@ -1373,6 +1612,7 @@ def analyze_borderline_threshold_sensitivity(
             # Optimized Rule decision
             if input_mode == 'logits':
                 dom_in = local_out
+                offload_logits = offload_mechanism(dom_in)
             elif input_mode == 'logits_plus':
                 probs = F.softmax(local_out, dim=1)
                 num_cls = probs.size(1)
@@ -1381,13 +1621,46 @@ def analyze_borderline_threshold_sensitivity(
                 margin = (top_k[:, 0] - top_k[:, 1]).unsqueeze(1) if k == 2 else torch.zeros(bs, 1, device=device)
                 entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1, keepdim=True) / math.log(num_cls)
                 dom_in = torch.cat([local_out, margin, entropy], dim=1)
+                offload_logits = offload_mechanism(dom_in)
+            elif input_mode == 'hybrid':
+                # ★ HYBRID mode
+                probs = F.softmax(local_out, dim=1)
+                num_cls = probs.size(1)
+                k = min(2, num_cls)
+                top_k = torch.topk(probs, k, dim=1).values
+                margin = (top_k[:, 0] - top_k[:, 1]).unsqueeze(1) if k == 2 else torch.zeros(bs, 1, device=device)
+                entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1, keepdim=True) / math.log(num_cls)
+                dom_in = torch.cat([local_out, margin, entropy], dim=1)
+                offload_logits = offload_mechanism(dom_in, feat=local_feats)
+            elif input_mode == 'logits_with_bk_pred':
+                # Use CloudLogitPredictor to predict cloud logits
+                dom_in = compute_logits_with_bk_pred(local_out, local_feats, cloud_predictor, local_out.size(1))
+                offload_logits = offload_mechanism(dom_in)
+            elif input_mode == 'logits_with_real_bk':
+                # Use actual cloud logits for upper bound testing
+                probs = F.softmax(local_out, dim=1)
+                num_cls = probs.size(1)
+                k = min(2, num_cls)
+                top_k = torch.topk(probs, k, dim=1).values
+                margin = (top_k[:, 0] - top_k[:, 1]).unsqueeze(1) if k == 2 else torch.zeros(bs, 1, device=device)
+                entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1, keepdim=True) / math.log(num_cls)
+                logits_plus = torch.cat([local_out, margin, entropy], dim=1)
+                local_probs_bk = F.softmax(local_out, dim=1)
+                cloud_probs_bk = F.softmax(cloud_out, dim=1)
+                real_bk = cloud_probs_bk - local_probs_bk
+                dom_in = torch.cat([logits_plus, real_bk], dim=1)
+                offload_logits = offload_mechanism(dom_in)
             elif input_mode in ('feat', 'shallow_feat'):
                 dom_in = local_feats
+                offload_logits = offload_mechanism(dom_in)
             else:
                 raise ValueError(f"Unknown input_mode: {input_mode}")
             
-            offload_logits = offload_mechanism(dom_in)
-            optimized_decisions = (torch.sigmoid(offload_logits).squeeze(1) > 0.5).float()
+            # ★ Regression mode - compare predicted bk with b_star
+            if regression_mode:
+                optimized_decisions = (offload_logits.squeeze(1) >= b_star).float()
+            else:
+                optimized_decisions = (torch.sigmoid(offload_logits).squeeze(1) > 0.5).float()
             
             # Predictions
             local_preds = local_out.argmax(dim=1)
@@ -2259,19 +2532,47 @@ def test_DDNN_with_optimized_rule(
             # 4) Offload mechanism prediction
             if input_mode == 'logits':
                 dom_in = local_out
+                dom_logits = offload_mechanism(dom_in)
             elif input_mode == 'img':
                 dom_in = images
+                dom_logits = offload_mechanism(dom_in)
             elif input_mode == 'logits_plus':
                 probs = F.softmax(local_out, dim=1)
                 top2 = torch.topk(probs, 2, dim=1).values
                 margin = (top2[:, 0] - top2[:, 1]).unsqueeze(1)
                 entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1, keepdim=True) / math.log(probs.size(1))
                 dom_in = torch.cat([local_out, margin, entropy], dim=1)
-            elif input_mode in ('feat', 'shallow_feat'):  # ⬅️ ΑΛΛΑΓΗ
+                dom_logits = offload_mechanism(dom_in)
+            elif input_mode == 'hybrid':
+                probs = F.softmax(local_out, dim=1)
+                top2 = torch.topk(probs, 2, dim=1).values
+                margin = (top2[:, 0] - top2[:, 1]).unsqueeze(1)
+                entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1, keepdim=True) / math.log(probs.size(1))
+                dom_in = torch.cat([local_out, margin, entropy], dim=1)
+                dom_logits = offload_mechanism(dom_in, feat=local_feats)
+            elif input_mode == 'logits_with_bk_pred':
+                # Use CloudLogitPredictor to predict cloud logits
+                dom_in = compute_logits_with_bk_pred(local_out, local_feats, cloud_predictor, local_out.size(1))
+                dom_logits = offload_mechanism(dom_in)
+            elif input_mode == 'logits_with_real_bk':
+                # Use actual cloud logits for upper bound testing
+                probs = F.softmax(local_out, dim=1)
+                num_cls = probs.size(1)
+                k = min(2, num_cls)
+                top_k = torch.topk(probs, k, dim=1).values
+                margin = (top_k[:, 0] - top_k[:, 1]).unsqueeze(1) if k == 2 else torch.zeros(bs, 1, device=device)
+                entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1, keepdim=True) / math.log(num_cls)
+                logits_plus = torch.cat([local_out, margin, entropy], dim=1)
+                local_probs_bk = F.softmax(local_out, dim=1)
+                cloud_probs_bk = F.softmax(cloud_out, dim=1)
+                real_bk = cloud_probs_bk - local_probs_bk
+                dom_in = torch.cat([logits_plus, real_bk], dim=1)
+                dom_logits = offload_mechanism(dom_in)
+            elif input_mode in ('feat', 'shallow_feat'):
                 dom_in = local_feats
+                dom_logits = offload_mechanism(dom_in)
             else:
                 raise ValueError(f"Unknown input_mode: {input_mode}")
-            dom_logits = offload_mechanism(dom_in)
             dom_probs = torch.sigmoid(dom_logits).squeeze(1)
             predicted_label = (dom_probs > threshold).float()
 

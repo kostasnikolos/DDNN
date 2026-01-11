@@ -206,3 +206,74 @@ class CloudCNN(nn.Module):
         x = self.fc3(x)
         
         return x
+
+
+class CloudLogitPredictor(nn.Module):
+    """
+    A lightweight model to predict cloud logits from local feature maps + local logits.
+
+    This model takes the feature maps from the LocalFeatureExtractor AND the local
+    classifier's output logits to approximate the CloudCNN's output.
+    The local logits provide valuable context about what the local model "sees".
+
+    Architecture:
+    - If logits_only=False (default): CNN encoder + local logits → cloud logits
+    - If logits_only=True: Simple FC layers (local logits → cloud logits)
+    """
+    def __init__(self, input_channels=32, num_classes=10, latent_dim=256, logits_only=False):
+        super().__init__()
+        self.num_classes = num_classes
+        self.latent_dim = latent_dim
+        self.logits_only = logits_only
+        
+        if self.logits_only:
+            # Simple FC-only architecture: local_logits → cloud_logits
+            self.fc_layers = nn.Sequential(
+                nn.Linear(num_classes, 128),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.2),
+                nn.Linear(128, 64),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.2),
+                nn.Linear(64, num_classes)
+            )
+        else:
+            # CNN encoder for features
+            self.conv1 = nn.Conv2d(input_channels, 64, kernel_size=3, padding=1)
+            self.bn1 = nn.BatchNorm2d(64)
+            
+            self.conv2 = nn.Conv2d(64, latent_dim, kernel_size=3, stride=2, padding=1)  # 16×16 → 8×8
+            self.bn2 = nn.BatchNorm2d(latent_dim)
+            
+            # Global Average Pooling
+            self.gap = nn.AdaptiveAvgPool2d(1)
+            
+            # Final FC: feature_vec (latent_dim) + local_logits (num_classes) → cloud_logits
+            self.fc = nn.Linear(latent_dim + num_classes, num_classes)
+
+    def forward(self, local_features, local_logits=None):
+        """
+        Predict cloud logits from local features + local logits (or just logits).
+        
+        Args:
+            local_features: (B, 32, 16, 16) from LocalFeatureExtractor (if logits_only=False)
+                           OR (B, num_classes) local logits (if logits_only=True)
+            local_logits: (B, num_classes) from LocalClassifier (only needed if logits_only=False)
+        
+        Returns:
+            (B, num_classes) predicted cloud logits
+        """
+        if self.logits_only:
+            # Simple FC path: local_logits → cloud_logits
+            return self.fc_layers(local_features)  # local_features is actually local_logits here
+        else:
+            # CNN + logits path
+            # Encode features
+            x = F.relu(self.bn1(self.conv1(local_features)))
+            x = F.relu(self.bn2(self.conv2(x)))
+            x = self.gap(x).flatten(1)  # (B, latent_dim)
+            
+            # Concatenate with local logits
+            x = torch.cat([x, local_logits], dim=1)  # (B, latent_dim + num_classes)
+            
+            return self.fc(x)  # (B, num_classes)

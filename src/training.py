@@ -164,70 +164,8 @@ def train_DDNN(train_loader,local_feature_extractor,local_classifier,cloud_cnn,c
 # OFFLOAD MECHANISM TRAINING
 # ============================================================================
 
-def evaluate_offload_decision_accuracy_CNN_train(loader, local_feature_extractor, local_classifier, cloud_cnn, deep_offload_model, b_star,threshold=0.5, *, input_mode='feat', device='cuda', num_classes=10):
-    """
-    Evaluate the offload decision accuracy of the deep offload mechanism on the given dataset.
-    This function:
-      1. Computes a ground truth (gt) based on the DDNN predictions (using local_classifier and cloud_cnn)
-         via the ORACLE labeling (not just bk threshold), and compares it with the provided labels from the offload dataset.
-      2. Passes the unflattened local features through the deep offload mechanism to get its predictions
-         and compares those with the computed gt.
-    Returns:
-      The offload decision accuracy (percentage) based on the deep offload mechanism.
-    """
-    correct_offload = 0
-    total_samples = 0
-    correct_gt_vs_loader = 0  # Accuracy between computed ground truth and loader labels
-    
-    deep_offload_model.eval()
-    local_feature_extractor.eval()
-    local_classifier.eval()
-    cloud_cnn.eval()
-
-    with torch.no_grad():
-        for x_tensor, offload_label, real_label, feature_tensor in loader:
-            x_tensor   = x_tensor.to(device)
-            feature_tensor = feature_tensor.to(device)
-            offload_label = offload_label.to(device)
-            real_label    = real_label.to(device)
-            bs = real_label.size(0)
-
-            # === 1) Υπολογίζεις local_probs, cloud_probs βάσει του ΠΡΑΓΜΑΤΙΚΟΥ label ===
-            # if we are in logits mode we already have them no need to compute them again
-            if input_mode == 'logits':
-                local_logits = x_tensor
-            elif input_mode == 'logits_plus':
-                # we already have them bu we need to cut the first 10 dim because now its 12
-                local_logits= x_tensor[:,:num_classes]
-            else:
-                local_logits = local_classifier(feature_tensor)
-            
-            
-            
-            cloud_logits = cloud_cnn(feature_tensor)
-
-            # === 1b) Oracle labeling ===
-            computed_gt = my_oracle_decision_function(local_logits, cloud_logits, real_label, b_star=b_star).float()
-
-            # === 2) Έλεγξε αν η stored offload_label ταιριάζει με computed_gt ===
-            # (ιδανικά ~100%)
-            # ψιλο unsused αλλα οκευ
-            correct_gt_vs_loader += (computed_gt == offload_label).sum().item()
-            # if not torch.equal(computed_gt,offload_label): print('Εχουμε θεμα  στην evaluate_offload_decision_train')
-            
-            # === 3) Δώσε local_feats στο deep_offload_model => offload απόφαση
-            logits_offload = deep_offload_model(x_tensor)
-            pred_offload   = (torch.sigmoid(logits_offload).squeeze(1) > threshold).float()
-
-            # Σύγκρινε pred_offload με computed_gt
-            correct_offload += (pred_offload == computed_gt).sum().item()
-            total_samples   += bs
-
-    gt_vs_loader_acc = 100.0 * correct_gt_vs_loader / total_samples
-    offload_acc      = 100.0 * correct_offload / total_samples
-    # print(f"Ground Truth vs OffloadDataset label accuracy: {gt_vs_loader_acc:.2f}%")
-    # print(f"Deep Offload CNN decision accuracy vs ground truth: {offload_acc:.2f}%")
-    return offload_acc
+# NOTE: evaluate_offload_decision_accuracy_CNN_train is imported from src.evaluation
+# in train_deep_offload_mechanism to avoid circular imports
 
 
 def train_deep_offload_mechanism(
@@ -248,7 +186,9 @@ def train_deep_offload_mechanism(
     stop_threshold=0.9,
     patience=20 , # Number of epochs to wait for early stopping
     return_history=False ,
-    num_classes=10
+    num_classes=10,
+    regression_mode=False,  # ★ NEW: Use MSELoss for regression
+    cloud_predictor=None  # ★ NEW: CloudLogitPredictor for logits_with_bk_pred mode
 ):
     """
     EXW AFAIRESEI TO TRAIN TESTING SE KATHE EPOCH GIA LOGOUS TAXYTHTAS
@@ -273,14 +213,23 @@ def train_deep_offload_mechanism(
         None
     """
     # Import here to avoid circular dependency
-    from src.evaluation import evaluate_offload_decision_accuracy_CNN_test
+    from src.evaluation import (
+        evaluate_offload_decision_accuracy_CNN_test,
+        evaluate_offload_decision_accuracy_CNN_train
+    )
     
     # === Create models directory if it doesn't exist and set checkpoint path ===
     models_dir = "models"
     os.makedirs(models_dir, exist_ok=True)
     checkpoint_path = os.path.join(models_dir, "best_offload_mechanism.pth")
 
-    criterion = nn.BCEWithLogitsLoss()
+    # ★ NEW: Choose loss function based on mode
+    if regression_mode:
+        criterion = nn.MSELoss()
+        print(f"  [Training] Regression mode: using MSELoss")
+    else:
+        criterion = nn.BCEWithLogitsLoss()
+    
     # -- We add these lists to store accuracies per epoch --
     train_acc_list = []  # Will hold offload_train_acc per epoch
     test_acc_list = []   # Will hold offload_test_acc per epoch
@@ -297,10 +246,40 @@ def train_deep_offload_mechanism(
             # local_feats: shape (batch, 8192) if flattened
             # labels: shape (batch,)
             x_tensor = x_tensor.to(device)
+            feature_tensor = feature_tensor.to(device)
             labels = labels.unsqueeze(1).to(device)  # shape: (batch,1)
 
             # Forward pass: compute logits
-            logits = offload_mechanism(x_tensor)
+            if input_mode == 'hybrid':
+                logits = offload_mechanism(x_tensor, feat=feature_tensor)
+            elif input_mode == 'logits_with_bk_pred':
+                # Compute predicted bk using cloud_predictor
+                with torch.no_grad():
+                    # Get local logits from x_tensor (first num_classes elements)
+                    local_logits = x_tensor[:, :num_classes]
+                    if hasattr(cloud_predictor, 'logits_only') and cloud_predictor.logits_only:
+                        predicted_cloud_logits = cloud_predictor(local_logits)  # FC-only mode
+                    else:
+                        predicted_cloud_logits = cloud_predictor(feature_tensor, local_logits)  # CNN+logits mode
+                    local_probs = F.softmax(local_logits, dim=1)
+                    predicted_cloud_probs = F.softmax(predicted_cloud_logits, dim=1)
+                    predicted_bk = predicted_cloud_probs - local_probs  # (batch, 10)
+                # Concatenate logits_plus with predicted_bk
+                combined_input = torch.cat([x_tensor, predicted_bk], dim=1)  # (batch, 22)
+                logits = offload_mechanism(combined_input)
+            elif input_mode == 'logits_with_real_bk':
+                # ★ TESTING: Compute REAL bk using actual cloud logits
+                with torch.no_grad():
+                    cloud_cnn.eval()
+                    real_cloud_logits = cloud_cnn(feature_tensor)
+                    local_probs = F.softmax(x_tensor[:, :num_classes], dim=1)
+                    real_cloud_probs = F.softmax(real_cloud_logits, dim=1)
+                    real_bk = real_cloud_probs - local_probs  # (batch, 10)
+                # Concatenate logits_plus with real_bk
+                combined_input = torch.cat([x_tensor, real_bk], dim=1)  # (batch, 22)
+                logits = offload_mechanism(combined_input)
+            else:
+                logits = offload_mechanism(x_tensor)
 
             # Compute loss
             loss = criterion(logits, labels)
@@ -326,10 +305,15 @@ def train_deep_offload_mechanism(
                 b_star,
                 threshold,
                 input_mode=input_mode,
-                num_classes=num_classes   
+                num_classes=num_classes,
+                regression_mode=regression_mode,  # ★ Pass regression flag
+                cloud_predictor=cloud_predictor  # ★ Pass cloud_predictor
             )
             offload_val_acc = evaluate_offload_decision_accuracy_CNN_test(
-                offload_mechanism, local_feature_extractor, local_classifier, cloud_cnn, val_loader, b_star,threshold,input_mode=input_mode
+                offload_mechanism, local_feature_extractor, local_classifier, cloud_cnn, val_loader, b_star, threshold,
+                input_mode=input_mode,
+                regression_mode=regression_mode,  # ★ Pass regression flag
+                cloud_predictor=cloud_predictor  # ★ Pass cloud_predictor
             )
 
         offload_scheduler.step(offload_val_acc)
@@ -359,7 +343,8 @@ def train_deep_offload_mechanism(
             offload_mechanism.load_state_dict(torch.load(checkpoint_path))
             break
 
-        # print(f"Epoch [{epoch+1}/{epochs}] - Loss: {avg_loss:.4f}, Offload Train Accuracy: {offload_train_acc:.2f}%, Offload Val Accuracy: {offload_val_acc:.2f}%, Learning Rate:{current_lr}")
+        # Print progress every epoch
+        print(f"Epoch [{epoch+1}/{epochs}] - Loss: {avg_loss:.4f}, Train Acc: {offload_train_acc:.2f}%, Val Acc: {offload_val_acc:.2f}%, LR: {current_lr:.6f}")
     
     # Load the best model at the end if it exists
     if os.path.isfile(checkpoint_path):

@@ -19,7 +19,7 @@ import torch
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.data import load_data
-from src.models import LocalFeatureExtractor, LocalClassifier, CloudCNN, OffloadMechanism
+from src.models import LocalFeatureExtractor, LocalClassifier, CloudCNN, OffloadMechanism, CloudLogitPredictor
 from src.utils import compute_bks_input_for_deep_offload, calculate_b_star, create_3d_data_deep
 from src.models import OffloadDatasetCNN
 from src.training import train_deep_offload_mechanism
@@ -41,11 +41,21 @@ DATASET_NAME = 'cifar10'
 BATCH_SIZE = 256
 L0 = 0.54  # Target local percentage
 TAU_BORDER = 0.01  # Borderline threshold
-INPUT_MODE = 'logits_plus'  # 'logits', 'logits_plus', 'feat'
-OFFLOAD_EPOCHS = 25
+INPUT_MODE = 'logits_with_bk_pred'  # Using CloudLogitPredictor (86% agreement)
+OFFLOAD_EPOCHS = 10  # Increased for better convergence
 DDNN_EPOCHS = 50  # Only used if MODE='train'
 LOCAL_WEIGHT = 0.7  # Weight for local loss in DDNN training
 NUM_CLASSES = 10
+LOGITS_ONLY_PREDICTOR = False  # Set to True to use FC-only CloudLogitPredictor
+# ★ Soft Labels Configuration (disabled when using regression)
+USE_SOFT_LABELS = False  # Disable - we're using regression now
+SOFT_LABEL_TEMPERATURE = 3.0
+
+# ★ Regression Mode Configuration
+USE_REGRESSION_MODE = False  # Back to classification for hybrid mode
+
+# ★ NEW: Hybrid Mode Configuration
+FEAT_LATENT_DIM = 32  # Compact latent dimension
 
 
 if __name__ == '__main__':
@@ -59,6 +69,11 @@ if __name__ == '__main__':
     print(f"  Borderline threshold (τ): {TAU_BORDER}")
     print(f"  Input mode: {INPUT_MODE}")
     print(f"  Offload training epochs: {OFFLOAD_EPOCHS}")
+    if INPUT_MODE == 'hybrid':
+        print(f"  ★ Hybrid Mode: feat_latent_dim={FEAT_LATENT_DIM}")
+    print(f"  ★ Regression Mode: {USE_REGRESSION_MODE}")
+    if not USE_REGRESSION_MODE and USE_SOFT_LABELS:
+        print(f"  ★ Soft Labels: {USE_SOFT_LABELS} (temperature={SOFT_LABEL_TEMPERATURE})")
     if MODE == 'train':
         print(f"  DDNN training epochs: {DDNN_EPOCHS}")
         print(f"  Local weight: {LOCAL_WEIGHT}")
@@ -143,6 +158,22 @@ if __name__ == '__main__':
         
         print("✓ DDNN models loaded successfully")
 
+    # Load CloudLogitPredictor if using logits_with_bk_pred mode
+    cloud_predictor = None
+    if INPUT_MODE == 'logits_with_bk_pred':
+        print("\n[Special] Loading CloudLogitPredictor for bk prediction...")
+        cloud_predictor = CloudLogitPredictor(num_classes=NUM_CLASSES, logits_only=LOGITS_ONLY_PREDICTOR).to(device)
+        predictor_path = os.path.join(models_dir, "cloud_logit_predictor_fc_only.pth" if LOGITS_ONLY_PREDICTOR else "cloud_logit_predictor.pth")
+        cloud_predictor.load_state_dict(
+            torch.load(predictor_path, map_location=device)
+        )
+        cloud_predictor.eval()
+        mode_str = "FC-only" if LOGITS_ONLY_PREDICTOR else "CNN+Logits"
+        print(f"✓ CloudLogitPredictor loaded successfully ({mode_str} mode)")
+    elif INPUT_MODE == 'logits_with_real_bk':
+        print("\n[TESTING MODE] Using REAL cloud logits (not available in production)")
+        print("This tests the theoretical upper bound with perfect cloud information")
+
     # ============================================================================
     # TRAIN OFFLOAD MECHANISM
     # ============================================================================
@@ -182,7 +213,12 @@ if __name__ == '__main__':
         use_oracle_labels=False,
         local_clf=local_classifier,
         cloud_clf=cloud_cnn,
-        device=device
+        device=device,
+        # Soft Labels (only when not in regression mode)
+        use_soft_labels=USE_SOFT_LABELS and not USE_REGRESSION_MODE,
+        soft_label_temperature=SOFT_LABEL_TEMPERATURE,
+        # Regression Mode - target is raw bk values
+        regression_target=USE_REGRESSION_MODE
     )
 
     offload_loader = DataLoader(offload_dataset, batch_size=BATCH_SIZE)
@@ -190,7 +226,9 @@ if __name__ == '__main__':
     # Initialize offload mechanism
     offload_model = OffloadMechanism(
         input_mode=INPUT_MODE,
-        num_classes=NUM_CLASSES
+        num_classes=NUM_CLASSES,
+        regression_mode=USE_REGRESSION_MODE,
+        feat_latent_dim=FEAT_LATENT_DIM if INPUT_MODE == 'hybrid' else 32
     ).to(device)
 
     optimizer = torch.optim.Adam(offload_model.parameters(), lr=1e-3, weight_decay=1e-4)
@@ -203,7 +241,9 @@ if __name__ == '__main__':
         b_star, scheduler,
         input_mode=INPUT_MODE, device=device,
         epochs=OFFLOAD_EPOCHS, lr=1e-3, stop_threshold=0.9,
-        num_classes=NUM_CLASSES
+        num_classes=NUM_CLASSES,
+        regression_mode=USE_REGRESSION_MODE,  # ★ Use MSELoss for regression
+        cloud_predictor=cloud_predictor  # ★ NEW: Pass CloudLogitPredictor
     )
 
     print("✓ Offload mechanism trained")
@@ -228,7 +268,9 @@ if __name__ == '__main__':
         device=device,
         dataset_name=DATASET_NAME,
         plot=True,
-        num_classes=NUM_CLASSES
+        num_classes=NUM_CLASSES,
+        regression_mode=USE_REGRESSION_MODE,  # ★ Pass regression flag
+        cloud_predictor=cloud_predictor  # ★ NEW: Pass CloudLogitPredictor
     )
 
     print("\n" + "="*80)
@@ -241,59 +283,41 @@ if __name__ == '__main__':
     print(f"  Borderline samples: {gap_results['borderline_count']} ({gap_results['borderline_misclass']:.1f}% misclass)")
     print(f"  Rational failures: {gap_results['rational_failure_count']} ({gap_results['rational_failure_misclass']:.1f}% misclass)")
     print(f"  Normal samples: {gap_results['normal_count']} ({gap_results['normal_misclass']:.1f}% misclass)")
-    
-    # DEBUG INFO
-    print(f"\n{'='*80}")
-    print("DEBUG: RATIONAL FAILURES ANALYSIS")
-    print(f"{'='*80}")
-    if gap_results['rational_failure_count'] < 100:
-        print(f"⚠️  WARNING: Only {gap_results['rational_failure_count']} rational failures found!")
-        print(f"\nRational failures breakdown:")
-        print(f"  - Rational ONLY wrong: {gap_results['rational_only_wrong']}")
-        print(f"  - Both rational AND borderline wrong: {gap_results['both_rational_and_borderline_wrong']}")
-        print(f"\nPossible reasons for low count:")
-        print(f"  1. Optimized mechanism learned to deviate from bk-rule (good!)")
-        print(f"  2. Oracle and bk-rule agree most of the time")
-        print(f"  3. When they disagree, optimized also deviates from bk-rule")
-        print(f"\nOverlaps:")
-        print(f"  - Borderline ∩ Rational: {gap_results['borderline_AND_rational']}")
-        print(f"  - Rational ∩ Disagreement: {gap_results['rational_AND_disagreement']}")
-    else:
-        print(f"✓ Found {gap_results['rational_failure_count']} rational failures")
 
     # ============================================================================
     # ANALYSIS 2: BORDERLINE THRESHOLD SENSITIVITY
     # ============================================================================
-    print(f"\n{'='*80}")
-    print("ANALYSIS 2: BORDERLINE THRESHOLD SENSITIVITY")
-    print(f"{'='*80}")
+    # print(f"\n{'='*80}")
+    # print("ANALYSIS 2: BORDERLINE THRESHOLD SENSITIVITY")
+    # print(f"{'='*80}")
 
-    # Test different threshold values
-    tau_values = [0.01, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30]
-    # tau_values = [0.01]
+    # # Test different threshold values
+    # tau_values = [0.01, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30]
+    # # tau_values = [0.01]
 
-    threshold_results = analyze_borderline_threshold_sensitivity(
-        offload_model,
-        local_feature_extractor,
-        local_classifier,
-        cloud_cnn,
-        test_loader,
-        b_star,
-        L0=L0,
-        tau_values=tau_values,
-        input_mode=INPUT_MODE,
-        device=device,
-        dataset_name=DATASET_NAME,
-        plot=True,
-        num_classes=NUM_CLASSES
-    )
+    # threshold_results = analyze_borderline_threshold_sensitivity(
+    #     offload_model,
+    #     local_feature_extractor,
+    #     local_classifier,
+    #     cloud_cnn,
+    #     test_loader,
+    #     b_star,
+    #     L0=L0,
+    #     tau_values=tau_values,
+    #     input_mode=INPUT_MODE,
+    #     device=device,
+    #     dataset_name=DATASET_NAME,
+    #     plot=True,
+    #     num_classes=NUM_CLASSES,
+    #     regression_mode=USE_REGRESSION_MODE  # ★ Pass regression flag
+    # )
 
-    print("\n" + "="*80)
-    print("THRESHOLD SENSITIVITY SUMMARY")
-    print("="*80)
-    print(f"  As τ increases, more samples are classified as 'borderline'")
-    print(f"  Optimal τ appears to be around {tau_values[2]:.2f} - {tau_values[3]:.2f}")
-    print(f"  where the distinction between borderline and normal samples is most meaningful.")
+    # print("\n" + "="*80)
+    # print("THRESHOLD SENSITIVITY SUMMARY")
+    # print("="*80)
+    # print(f"  As τ increases, more samples are classified as 'borderline'")
+    # print(f"  Optimal τ appears to be around {tau_values[2]:.2f} - {tau_values[3]:.2f}")
+    # print(f"  where the distinction between borderline and normal samples is most meaningful.")
 
     print("\n" + "="*80)
     print("ANALYSIS COMPLETE!")
