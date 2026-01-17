@@ -25,12 +25,12 @@ from src.evaluation import (
 
 
 def main(
-    epochs_DDNN=1,
-    epochs_optimization=1,
+    epochs_DDNN=50,
+    epochs_optimization=30,
     batch_size=256,
     L0=0.54,
     local_weight=0.7,
-    mode='train',
+    mode='load',
     dataset_name='cifar10',
     testing_mode='offload_mechanism'
 ):
@@ -54,7 +54,8 @@ def main(
         'cifar100': 100,  # harder 100-class variant
         'cinic10': 10,   # CIFAR/ImageNet mix (32×32)
         'svhn': 10,   # street-view digits (32×32)
-        'gtsrb32': 43    # traffic signs (32×32)
+        'gtsrb32': 43,   # traffic signs (32×32)
+        'fashion_mnist': 10  # Fashion-MNIST (28×28 → 32×32, grayscale → RGB)
     }
     
     # Set NUM_CLASSES based on dataset - must be done BEFORE importing models
@@ -88,7 +89,7 @@ def main(
     
     # Initialize scheduler after optimizer
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(cnn_optimizer, mode='min', factor=0.5, patience=10)
-    
+    print("✓ Models and optimizers initialized successfully!")
     if mode == 'train':
         # Train the DDNN network
         print(f"\nTraining DDNN for {epochs_DDNN} epochs...")
@@ -103,11 +104,11 @@ def main(
         )
         
         # === Save models in the 'models' directory ===
-        torch.save(local_feature_extractor.state_dict(), os.path.join(models_dir, "local_feature_extractor.pth"))
-        torch.save(local_classifier.state_dict(), os.path.join(models_dir, "local_classifier.pth"))
-        torch.save(cloud_cnn.state_dict(), os.path.join(models_dir, "cloud_cnn.pth"))
-        torch.save(offload_mechanism.state_dict(), os.path.join(models_dir, "offload_mechanism.pth"))
-        print("\n✓ Models saved successfully in 'models/' directory!")
+        torch.save(local_feature_extractor.state_dict(), os.path.join(models_dir, f"local_feature_extractor_{dataset_name}.pth"))
+        torch.save(local_classifier.state_dict(), os.path.join(models_dir, f"local_classifier_{dataset_name}.pth"))
+        torch.save(cloud_cnn.state_dict(), os.path.join(models_dir, f"cloud_cnn_{dataset_name}.pth"))
+        torch.save(offload_mechanism.state_dict(), os.path.join(models_dir, f"offload_mechanism_{dataset_name}.pth"))
+        print(f"\n✓ Models saved successfully in 'models/' directory (dataset: {dataset_name})!")
     
     else:  # mode == 'test'
         # Load the models from the 'models' directory
@@ -134,7 +135,6 @@ def main(
     if testing_mode == 'offload_mechanism':
         # Test offload mechanism across multiple L0 values
         L0_values = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.55, 0.585, 0.6, 0.7, 0.9, 1]
-        L0_values = [0]
         results = testing_offload_mechanism(
             L0_values=L0_values,
             local_feature_extractor=local_feature_extractor,
@@ -143,7 +143,7 @@ def main(
             train_loader=train_loader,
             test_loader=test_loader,
             val_loader=val_loader,
-            methods_to_test=['logits', 'logits_plus', 'entropy', 'oracle'],
+            methods_to_test=['logits',  'entropy'],
             device='cuda',
             offload_epochs=epochs_optimization,
             batch_size=batch_size,

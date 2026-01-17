@@ -30,7 +30,7 @@ from src.models import LocalFeatureExtractor, CloudCNN, CloudLogitPredictor
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 DATASET_NAME = 'cifar10'
 BATCH_SIZE = 512
-EPOCHS = 50
+EPOCHS = 25
 LR = 0.001
 LOGITS_ONLY = False  # Set to True for simple FC-only architecture (local_logits → cloud_logits)
 MODEL_SAVE_PATH = 'models/cloud_logit_predictor.pth' if not LOGITS_ONLY else 'models/cloud_logit_predictor_fc_only.pth'

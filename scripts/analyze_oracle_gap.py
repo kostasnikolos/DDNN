@@ -41,39 +41,47 @@ DATASET_NAME = 'cifar10'
 BATCH_SIZE = 256
 L0 = 0.54  # Target local percentage
 TAU_BORDER = 0.01  # Borderline threshold
-INPUT_MODE = 'logits_with_bk_pred'  # Using CloudLogitPredictor (86% agreement)
-OFFLOAD_EPOCHS = 10  # Increased for better convergence
+
+# ★ Multi-Mode Comparison Configuration
+RUN_MULTI_MODE_COMPARISON = True  # Set to True to test all modes
+SINGLE_INPUT_MODE = INPUT_MODE = 'logits_plus'  # Used only if RUN_MULTI_MODE_COMPARISON = False
+
+# Modes to compare (if RUN_MULTI_MODE_COMPARISON = True)
+MODES_TO_COMPARE = [
+    'logits',
+    'logits_plus', 
+    'logits_with_bk_pred',
+    'logits_with_real_bk',
+    'logits_predicted_regression',  # with predicted cloud logits
+]
+
+OFFLOAD_EPOCHS = 20  # Epochs for offload training
 DDNN_EPOCHS = 50  # Only used if MODE='train'
 LOCAL_WEIGHT = 0.7  # Weight for local loss in DDNN training
 NUM_CLASSES = 10
 LOGITS_ONLY_PREDICTOR = False  # Set to True to use FC-only CloudLogitPredictor
-# ★ Soft Labels Configuration (disabled when using regression)
-USE_SOFT_LABELS = False  # Disable - we're using regression now
-SOFT_LABEL_TEMPERATURE = 3.0
 
-# ★ Regression Mode Configuration
-USE_REGRESSION_MODE = False  # Back to classification for hybrid mode
-
-# ★ NEW: Hybrid Mode Configuration
-FEAT_LATENT_DIM = 32  # Compact latent dimension
+# ★ Hybrid Mode Configuration
+FEAT_LATENT_DIM = 32  # Compact latent dimension for hybrid mode
 
 
 if __name__ == '__main__':
     print("="*80)
-    print("ORACLE vs OPTIMIZED RULE GAP ANALYSIS")
+    print("ORACLE vs OPTIMIZED RULE - MULTI-MODE COMPARISON" if RUN_MULTI_MODE_COMPARISON else "ORACLE vs OPTIMIZED RULE GAP ANALYSIS")
     print("="*80)
     print(f"\nConfiguration:")
     print(f"  Mode: {MODE}")
     print(f"  Dataset: {DATASET_NAME}")
     print(f"  L0: {L0}")
     print(f"  Borderline threshold (τ): {TAU_BORDER}")
-    print(f"  Input mode: {INPUT_MODE}")
+    
+    if RUN_MULTI_MODE_COMPARISON:
+        print(f"  ★ Multi-Mode Comparison: Testing {len(MODES_TO_COMPARE)} modes")
+        print(f"     Modes: {', '.join(MODES_TO_COMPARE)}")
+    else:
+        print(f"  Input mode: {SINGLE_INPUT_MODE}")
+    
     print(f"  Offload training epochs: {OFFLOAD_EPOCHS}")
-    if INPUT_MODE == 'hybrid':
-        print(f"  ★ Hybrid Mode: feat_latent_dim={FEAT_LATENT_DIM}")
-    print(f"  ★ Regression Mode: {USE_REGRESSION_MODE}")
-    if not USE_REGRESSION_MODE and USE_SOFT_LABELS:
-        print(f"  ★ Soft Labels: {USE_SOFT_LABELS} (temperature={SOFT_LABEL_TEMPERATURE})")
     if MODE == 'train':
         print(f"  DDNN training epochs: {DDNN_EPOCHS}")
         print(f"  Local weight: {LOCAL_WEIGHT}")
@@ -158,10 +166,10 @@ if __name__ == '__main__':
         
         print("✓ DDNN models loaded successfully")
 
-    # Load CloudLogitPredictor if using logits_with_bk_pred mode
+    # Load CloudLogitPredictor if using logits_with_bk_pred or logits_predicted_regression mode
     cloud_predictor = None
-    if INPUT_MODE == 'logits_with_bk_pred':
-        print("\n[Special] Loading CloudLogitPredictor for bk prediction...")
+    if INPUT_MODE in ['logits_with_bk_pred', 'logits_predicted_regression']:
+        print(f"\n[Special] Loading CloudLogitPredictor for {INPUT_MODE} mode...")
         cloud_predictor = CloudLogitPredictor(num_classes=NUM_CLASSES, logits_only=LOGITS_ONLY_PREDICTOR).to(device)
         predictor_path = os.path.join(models_dir, "cloud_logit_predictor_fc_only.pth" if LOGITS_ONLY_PREDICTOR else "cloud_logit_predictor.pth")
         cloud_predictor.load_state_dict(
@@ -214,11 +222,8 @@ if __name__ == '__main__':
         local_clf=local_classifier,
         cloud_clf=cloud_cnn,
         device=device,
-        # Soft Labels (only when not in regression mode)
-        use_soft_labels=USE_SOFT_LABELS and not USE_REGRESSION_MODE,
-        soft_label_temperature=SOFT_LABEL_TEMPERATURE,
-        # Regression Mode - target is raw bk values
-        regression_target=USE_REGRESSION_MODE
+        # Regression Mode - target is raw bk values (for logits_predicted_regression)
+        regression_target=(INPUT_MODE == 'logits_predicted_regression')
     )
 
     offload_loader = DataLoader(offload_dataset, batch_size=BATCH_SIZE)
@@ -227,7 +232,6 @@ if __name__ == '__main__':
     offload_model = OffloadMechanism(
         input_mode=INPUT_MODE,
         num_classes=NUM_CLASSES,
-        regression_mode=USE_REGRESSION_MODE,
         feat_latent_dim=FEAT_LATENT_DIM if INPUT_MODE == 'hybrid' else 32
     ).to(device)
 
@@ -242,8 +246,8 @@ if __name__ == '__main__':
         input_mode=INPUT_MODE, device=device,
         epochs=OFFLOAD_EPOCHS, lr=1e-3, stop_threshold=0.9,
         num_classes=NUM_CLASSES,
-        regression_mode=USE_REGRESSION_MODE,  # ★ Use MSELoss for regression
-        cloud_predictor=cloud_predictor  # ★ NEW: Pass CloudLogitPredictor
+        cloud_predictor=cloud_predictor,
+        dataset_name=DATASET_NAME
     )
 
     print("✓ Offload mechanism trained")
@@ -269,8 +273,8 @@ if __name__ == '__main__':
         dataset_name=DATASET_NAME,
         plot=True,
         num_classes=NUM_CLASSES,
-        regression_mode=USE_REGRESSION_MODE,  # ★ Pass regression flag
-        cloud_predictor=cloud_predictor  # ★ NEW: Pass CloudLogitPredictor
+        cloud_predictor=cloud_predictor,
+        test_with_real_cloud_logits=TEST_WITH_REAL_CLOUD_LOGITS
     )
 
     print("\n" + "="*80)

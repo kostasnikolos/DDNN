@@ -19,7 +19,8 @@ from src.utils import (
     compute_bks_input_for_deep_offload,
     calculate_b_star,
     create_3d_data_deep,
-    calculate_normalized_entropy
+    calculate_normalized_entropy,
+    calibrate_threshold
 )
 from src.models import OffloadMechanism, OffloadDatasetCNN
 import src.data.data_loader  # Import module to access dynamic NUM_CLASSES
@@ -32,30 +33,51 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def compute_logits_with_bk_pred(local_out, local_feats, cloud_predictor, num_classes):
     """
-    Helper function to compute combined input for logits_with_bk_pred mode.
+    Compute combined input for logits_with_bk_pred mode.
+    
+    Combines two signals:
+    1. logits_plus (12-dim): local logits + uncertainty measures (margin, entropy)
+    2. predicted_bk (10-dim): predicted difference between cloud and local outputs
+    
+    The OffloadMechanism learns to use these signals for offloading decisions.
+    
+    Args:
+        local_out: (B, num_classes) local logits
+        local_feats: (B, 32, 16, 16) local feature maps
+        cloud_predictor: CloudLogitPredictor model
+        num_classes: number of classes (typically 10)
     
     Returns:
-        combined_input: shape (batch, 22) = logits_plus (12) + predicted_bk (10)
+        combined_input: (B, 22) concatenation of logits_plus (12) + predicted_bk (10)
     """
-    # Compute logits_plus
+    # ★ SIGNAL 1: logits_plus = local logits + uncertainty measures
     probs = F.softmax(local_out, dim=1)
     top2 = torch.topk(probs, 2, dim=1).values
-    margin = (top2[:, 0] - top2[:, 1]).unsqueeze(1)
-    entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1, keepdim=True) / math.log(num_classes)
-    logits_plus = torch.cat([local_out, margin, entropy], dim=1)  # (batch, 12)
     
-    # Compute predicted_bk using features + local_logits (or just local_logits if FC-only mode)
+    # Margin: confidence in top prediction (top1_prob - top2_prob)
+    margin = (top2[:, 0] - top2[:, 1]).unsqueeze(1)
+    
+    # Entropy: uncertainty of the local model (normalized)
+    entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1, keepdim=True) / math.log(num_classes)
+    
+    logits_plus = torch.cat([local_out, margin, entropy], dim=1)  # (B, 12)
+    
+    # ★ SIGNAL 2: predicted_bk = difference between predicted cloud and local outputs
+    # The CloudLogitPredictor acts as a "cloud oracle" that hasn't seen the ground truth
     with torch.no_grad():
         if hasattr(cloud_predictor, 'logits_only') and cloud_predictor.logits_only:
-            predicted_cloud_logits = cloud_predictor(local_out)  # FC-only mode
+            # FC-only mode: only use local logits
+            predicted_cloud_logits = cloud_predictor(local_out)
         else:
-            predicted_cloud_logits = cloud_predictor(local_feats, local_out)  # CNN+logits mode
+            # CNN+Logits mode: use both features and logits (better accuracy)
+            predicted_cloud_logits = cloud_predictor(local_feats, local_out)
+        
         predicted_cloud_probs = F.softmax(predicted_cloud_logits, dim=1)
         local_probs = F.softmax(local_out, dim=1)
-        predicted_bk = predicted_cloud_probs - local_probs  # (batch, 10)
+        predicted_bk = predicted_cloud_probs - local_probs  # (B, 10)
     
-    # Concatenate
-    combined_input = torch.cat([logits_plus, predicted_bk], dim=1)  # (batch, 22)
+    # Concatenate both signals for OffloadMechanism input
+    combined_input = torch.cat([logits_plus, predicted_bk], dim=1)  # (B, 22)
     return combined_input
 
 
@@ -84,6 +106,36 @@ def compute_logits_with_real_bk(local_out, cloud_out, num_classes):
     return combined_input
 
 
+def compute_logits_predicted_regression(local_out, local_feats, cloud_predictor):
+    """
+    Compute input for logits_predicted_regression mode.
+    
+    This is a simplified regression approach where:
+    - Input: local_logits (10) + predicted_cloud_logits (10) = 20-dim
+    - Output: OffloadMechanism predicts continuous bk value
+    - Decision: predicted_bk ≥ b_star → offload
+    
+    The key insight: we concatenate raw logits from both models,
+    and let the OffloadMechanism learn to predict bk directly.
+    
+    Args:
+        local_out: (B, num_classes) local logits
+        local_feats: (B, 32, 16, 16) local feature maps
+        cloud_predictor: CloudLogitPredictor model
+    
+    Returns:
+        combined_input: (B, 20) concatenation of local_logits + predicted_cloud_logits
+    """
+    with torch.no_grad():
+        if hasattr(cloud_predictor, 'logits_only') and cloud_predictor.logits_only:
+            predicted_cloud_logits = cloud_predictor(local_out)  # FC-only mode
+        else:
+            predicted_cloud_logits = cloud_predictor(local_feats, local_out)  # CNN+logits mode
+    
+    # Concatenate local and predicted cloud logits
+    combined_input = torch.cat([local_out, predicted_cloud_logits], dim=1)  # (B, 20)
+    return combined_input
+
 
 # ============================================================================
 # OFFLOAD MECHANISM EVALUATION
@@ -98,8 +150,8 @@ def evaluate_offload_decision_accuracy_CNN_test(
     b_star,
     threshold=0.5,
     *, input_mode='feat', device='cuda',
-    regression_mode=False,  # ★ NEW: For regression, compare predicted_bk > b_star
-    cloud_predictor=None  # ★ NEW: For logits_with_bk_pred mode
+    cloud_predictor=None,  # ★ For logits_with_bk_pred mode
+    test_with_real_cloud_logits=False  # ★ NEW: Use real cloud logits in inference (for testing)
 ):
     """
     Evaluates the offload decisions on test data by comparing:
@@ -124,6 +176,9 @@ def evaluate_offload_decision_accuracy_CNN_test(
         offload_accuracy (float): The percentage of correctly matched decisions between
                                   oracle labeling and offload mechanism output.
     """
+    
+    # Auto-detect regression mode from input_mode
+    regression_mode = (input_mode == 'logits_predicted_regression')
     
     # Put models in eval mode
     offload_mechanism.eval()
@@ -184,6 +239,16 @@ def evaluate_offload_decision_accuracy_CNN_test(
                 # ★ TESTING: logits_plus + REAL bk
                 num_cls = local_out.size(1)
                 combined_input = compute_logits_with_real_bk(local_out, cloud_out, num_cls)
+                logits = offload_mechanism(combined_input)
+            elif input_mode == 'logits_predicted_regression':
+                # ★ Regression approach - predicts bk directly
+                # INFERENCE: Use real or predicted cloud logits based on flag
+                if test_with_real_cloud_logits:
+                    # TESTING: Use real cloud logits (should achieve high accuracy)
+                    combined_input = torch.cat([local_out, cloud_out], dim=1)  # (B, 20)
+                else:
+                    # PRODUCTION: Use predicted cloud logits
+                    combined_input = compute_logits_predicted_regression(local_out, local_feats, cloud_predictor)
                 logits = offload_mechanism(combined_input)
             else:
                 raise ValueError(f"Unknown input_mode: {input_mode}")
@@ -307,7 +372,7 @@ def test_DDNN_with_oracle(
 
 
 
-def evaluate_offload_decision_accuracy_CNN_train(loader, local_feature_extractor, local_classifier, cloud_cnn, deep_offload_model, b_star,threshold=0.5, *, input_mode='feat', device='cuda',num_classes=10, regression_mode=False, cloud_predictor=None):
+def evaluate_offload_decision_accuracy_CNN_train(loader, local_feature_extractor, local_classifier, cloud_cnn, deep_offload_model, b_star,threshold=0.5, *, input_mode='feat', device='cuda',num_classes=10, cloud_predictor=None, test_with_real_cloud_logits=False):
     """
     Evaluate the offload decision accuracy of the deep offload mechanism on the given dataset.
     This function:
@@ -318,6 +383,9 @@ def evaluate_offload_decision_accuracy_CNN_train(loader, local_feature_extractor
     Returns:
       The offload decision accuracy (percentage) based on the deep offload mechanism.
     """
+    # Auto-detect regression mode from input_mode
+    regression_mode = (input_mode == 'logits_predicted_regression')
+    
     correct_offload = 0
     total_samples = 0
     correct_gt_vs_loader = 0  # Accuracy between computed ground truth and loader labels
@@ -367,6 +435,15 @@ def evaluate_offload_decision_accuracy_CNN_train(loader, local_feature_extractor
             elif input_mode == 'logits_with_real_bk':
                 combined_input = compute_logits_with_real_bk(local_logits, cloud_logits, num_classes)
                 logits_offload = deep_offload_model(combined_input)
+            elif input_mode == 'logits_predicted_regression':
+                # Regression approach - predicts bk directly
+                if test_with_real_cloud_logits:
+                    # TESTING: Use real cloud logits
+                    combined_input = torch.cat([local_logits, cloud_logits], dim=1)  # (B, 20)
+                else:
+                    # PRODUCTION: Use predicted cloud logits
+                    combined_input = compute_logits_predicted_regression(local_logits, feature_tensor, cloud_predictor)
+                logits_offload = deep_offload_model(combined_input)
             else:
                 logits_offload = deep_offload_model(x_tensor)
             
@@ -403,7 +480,9 @@ def analyze_border_noisy_misclassification(
     device: str = 'cuda',
     dataset_name: str = 'cifar10',
     plot: bool = True,
-    num_classes: int = 10
+    num_classes: int = 10,
+    cloud_predictor=None,
+    test_with_real_cloud_logits: bool = False
 ) -> Dict:
     """
     Two-phase analysis:
@@ -464,7 +543,8 @@ def analyze_border_noisy_misclassification(
         b_star, scheduler,
         input_mode=input_mode, device=device,
         epochs=offload_epochs, lr=1e-3, stop_threshold=0.9,
-        num_classes=num_classes
+        num_classes=num_classes,
+        dataset_name=dataset_name
     )
     
     # ================================================================
@@ -593,6 +673,15 @@ def analyze_border_noisy_misclassification(
                 real_bk = cloud_probs_bk - local_probs_bk
                 dom_in = torch.cat([logits_plus, real_bk], dim=1)
                 offload_logits = offload_model(dom_in)
+            elif input_mode == 'logits_predicted_regression':
+                # Regression approach - predicts bk directly
+                if test_with_real_cloud_logits:
+                    # TESTING: Use real cloud logits
+                    combined_input = torch.cat([local_out, cloud_out], dim=1)  # (B, 20)
+                else:
+                    # PRODUCTION: Use predicted cloud logits
+                    combined_input = compute_logits_predicted_regression(local_out, local_feats, cloud_predictor)
+                offload_logits = offload_model(combined_input)
             elif input_mode in ('feat', 'shallow_feat'):
                 dom_in = local_feats
                 offload_logits = offload_model(dom_in)
@@ -745,8 +834,8 @@ def analyze_oracle_optimized_gap(
     dataset_name: str = 'cifar10',
     plot: bool = True,
     num_classes: int = 10,
-    regression_mode: bool = False,  # ★ NEW: For regression, compare predicted_bk > b_star
-    cloud_predictor = None  # ★ NEW: For logits_with_bk_pred mode
+    cloud_predictor = None,  # ★ For logits_with_bk_pred mode
+    test_with_real_cloud_logits: bool = False  # ★ NEW: Use real cloud logits in inference
 ) -> Dict:
     """
     Comprehensive analysis to explain the Oracle vs Optimized Rule performance gap.
@@ -773,6 +862,9 @@ def analyze_oracle_optimized_gap(
     dict
         Detailed metrics for each sample category including misclassification rates
     """
+    
+    # Auto-detect regression mode from input_mode
+    regression_mode = (input_mode == 'logits_predicted_regression')
     
     print(f"\n{'='*80}")
     print(f"ORACLE vs OPTIMIZED RULE GAP ANALYSIS")
@@ -852,6 +944,15 @@ def analyze_oracle_optimized_gap(
                 num_cls = local_out.size(1)
                 dom_in = compute_logits_with_real_bk(local_out, cloud_out, num_cls)
                 offload_logits = offload_mechanism(dom_in)
+            elif input_mode == 'logits_predicted_regression':
+                # Regression approach - predicts bk directly
+                if test_with_real_cloud_logits:
+                    # TESTING: Use real cloud logits
+                    combined_input = torch.cat([local_out, cloud_out], dim=1)  # (B, 20)
+                else:
+                    # PRODUCTION: Use predicted cloud logits
+                    combined_input = compute_logits_predicted_regression(local_out, local_feats, cloud_predictor)
+                offload_logits = offload_mechanism(combined_input)
             elif input_mode in ('feat', 'shallow_feat'):
                 dom_in = local_feats
                 offload_logits = offload_mechanism(dom_in)
@@ -987,6 +1088,15 @@ def analyze_oracle_optimized_gap(
                 real_bk = cloud_probs_bk - local_probs_bk
                 dom_in = torch.cat([logits_plus, real_bk], dim=1)
                 offload_logits = offload_mechanism(dom_in)
+            elif input_mode == 'logits_predicted_regression':
+                # Regression approach - predicts bk directly
+                if test_with_real_cloud_logits:
+                    # TESTING: Use real cloud logits
+                    combined_input = torch.cat([local_out, cloud_out], dim=1)  # (B, 20)
+                else:
+                    # PRODUCTION: Use predicted cloud logits
+                    combined_input = compute_logits_predicted_regression(local_out, local_feats, cloud_predictor)
+                offload_logits = offload_mechanism(combined_input)
             elif input_mode in ('feat', 'shallow_feat'):
                 dom_in = local_feats
                 offload_logits = offload_mechanism(dom_in)
@@ -1100,6 +1210,15 @@ def analyze_oracle_optimized_gap(
                 real_bk = cloud_probs_bk - local_probs_bk
                 dom_in = torch.cat([logits_plus, real_bk], dim=1)
                 offload_logits = offload_mechanism(dom_in)
+            elif input_mode == 'logits_predicted_regression':
+                # Regression approach - predicts bk directly
+                if test_with_real_cloud_logits:
+                    # TESTING: Use real cloud logits
+                    combined_input = torch.cat([local_out, cloud_out], dim=1)  # (B, 20)
+                else:
+                    # PRODUCTION: Use predicted cloud logits
+                    combined_input = compute_logits_predicted_regression(local_out, local_feats, cloud_predictor)
+                offload_logits = offload_mechanism(combined_input)
             elif input_mode in ('feat', 'shallow_feat'):
                 dom_in = local_feats
                 offload_logits = offload_mechanism(dom_in)
@@ -1236,6 +1355,15 @@ def analyze_oracle_optimized_gap(
                 real_bk = cloud_probs_bk - local_probs_bk
                 dom_in = torch.cat([logits_plus, real_bk], dim=1)
                 offload_logits = offload_mechanism(dom_in)
+            elif input_mode == 'logits_predicted_regression':
+                # Regression approach - predicts bk directly
+                if test_with_real_cloud_logits:
+                    # TESTING: Use real cloud logits
+                    combined_input = torch.cat([local_out, cloud_out], dim=1)  # (B, 20)
+                else:
+                    # PRODUCTION: Use predicted cloud logits
+                    combined_input = compute_logits_predicted_regression(local_out, local_feats, cloud_predictor)
+                offload_logits = offload_mechanism(combined_input)
             elif input_mode in ('feat', 'shallow_feat'):
                 dom_in = local_feats
                 offload_logits = offload_mechanism(dom_in)
@@ -1553,7 +1681,8 @@ def analyze_borderline_threshold_sensitivity(
     dataset_name: str = 'cifar10',
     plot: bool = True,
     num_classes: int = 10,
-    regression_mode: bool = False  # ★ NEW: For regression, compare predicted_bk > b_star
+    cloud_predictor=None,
+    test_with_real_cloud_logits: bool = False  # ★ NEW: Use real cloud logits in inference
 ) -> Dict:
     """
     Analyze how different borderline thresholds affect classification performance.
@@ -1572,6 +1701,9 @@ def analyze_borderline_threshold_sensitivity(
     dict
         Results for each threshold including misclassification rates
     """
+    
+    # Auto-detect regression mode from input_mode
+    regression_mode = (input_mode == 'logits_predicted_regression')
     
     if tau_values is None:
         tau_values = [0.01, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30]
@@ -1650,6 +1782,15 @@ def analyze_borderline_threshold_sensitivity(
                 real_bk = cloud_probs_bk - local_probs_bk
                 dom_in = torch.cat([logits_plus, real_bk], dim=1)
                 offload_logits = offload_mechanism(dom_in)
+            elif input_mode == 'logits_predicted_regression':
+                # Regression approach - predicts bk directly
+                if test_with_real_cloud_logits:
+                    # TESTING: Use real cloud logits
+                    combined_input = torch.cat([local_out, cloud_out], dim=1)  # (B, 20)
+                else:
+                    # PRODUCTION: Use predicted cloud logits
+                    combined_input = compute_logits_predicted_regression(local_out, local_feats, cloud_predictor)
+                offload_logits = offload_mechanism(combined_input)
             elif input_mode in ('feat', 'shallow_feat'):
                 dom_in = local_feats
                 offload_logits = offload_mechanism(dom_in)
@@ -1889,7 +2030,9 @@ def testing_offload_mechanism(
     batch_size: int = 128,
     dataset_name: str = 'cifar10',
     evaluation_target: str = 'ddnn_overall',
-    num_classes: int = 10
+    num_classes: int = 10,
+    cloud_predictor: nn.Module = None,
+    feat_latent_dim: int = 32
 ):
     """
     Universal testing function for offload mechanism evaluation.
@@ -1912,7 +2055,8 @@ def testing_offload_mechanism(
         }
     """
     
-    INPUT_MODES = {'feat', 'shallow_feat', 'img', 'logits', 'logits_plus'}
+    INPUT_MODES = {'feat', 'shallow_feat', 'img', 'logits', 'logits_plus', 
+                    'hybrid', 'logits_with_bk_pred', 'logits_with_real_bk', 'logits_predicted_regression'}
     BASELINES = {'entropy', 'oracle', 'local_standalone', 'cloud_standalone', 'random'}
     
     offload_modes = [m for m in methods_to_test if m in INPUT_MODES]
@@ -1985,6 +2129,9 @@ def testing_offload_mechanism(
                 input_mode=mode
             )
             
+            # Determine if regression mode for dataset
+            is_regression = (mode == 'logits_predicted_regression')
+            
             offload_dataset = OffloadDatasetCNN(
                 combined_data, b_star,
                 input_mode=mode,
@@ -1992,14 +2139,16 @@ def testing_offload_mechanism(
                 use_oracle_labels=False,
                 local_clf=local_classifier,
                 cloud_clf=cloud_cnn,
-                device=device
+                device=device,
+                regression_target=is_regression
             )
             
             offload_loader = DataLoader(offload_dataset, batch_size=batch_size)
             
             offload_model = OffloadMechanism(
                 input_mode=mode,
-                num_classes=num_classes
+                num_classes=num_classes,
+                feat_latent_dim=feat_latent_dim
             ).to(device)
             
             optimizer = torch.optim.Adam(offload_model.parameters(), lr=1e-3, weight_decay=1e-4)
@@ -2011,7 +2160,9 @@ def testing_offload_mechanism(
                 b_star, scheduler,
                 input_mode=mode, device=device,
                 epochs=offload_epochs, lr=1e-3, stop_threshold=0.9,
-                num_classes=num_classes
+                num_classes=num_classes,
+                cloud_predictor=cloud_predictor,
+                dataset_name=dataset_name
             )
             
             # ⬇️ ΑΛΛΑΓΗ: Evaluate offload accuracies ONLY in offload_validation mode
@@ -2040,7 +2191,8 @@ def testing_offload_mechanism(
             elif evaluation_target == 'ddnn_overall':
                 local_pct, ddnn_acc = test_DDNN_with_optimized_rule(
                     offload_model, local_feature_extractor, local_classifier,
-                    cloud_cnn, test_loader, b_star, input_mode=mode, device=device
+                    cloud_cnn, test_loader, b_star, input_mode=mode, device=device,
+                    cloud_predictor=cloud_predictor
                 )
                 
                 if reference_local_pct is None:
@@ -2407,7 +2559,8 @@ def test_offload_overfitting(
             input_mode=mode, device=device,
             epochs=offload_epochs, lr=1e-3, stop_threshold=0.9,
             return_history=True,  # ⬅️ Enable history tracking
-            num_classes=num_classes
+            num_classes=num_classes,
+            dataset_name=dataset_name
         )
         
         # Store results
@@ -2478,7 +2631,9 @@ def test_DDNN_with_optimized_rule(
     b_star,
     threshold=0.5,
     input_mode= 'feat',
-    device='cuda'
+    device='cuda',
+    cloud_predictor=None,
+    test_with_real_cloud_logits=False
 ):
     """
     Evaluates the offload decisions on test data by comparing:
@@ -2560,7 +2715,7 @@ def test_DDNN_with_optimized_rule(
                 num_cls = probs.size(1)
                 k = min(2, num_cls)
                 top_k = torch.topk(probs, k, dim=1).values
-                margin = (top_k[:, 0] - top_k[:, 1]).unsqueeze(1) if k == 2 else torch.zeros(bs, 1, device=device)
+                margin = (top_k[:, 0] - top_k[:, 1]).unsqueeze(1) if k == 2 else torch.zeros(batch_size, 1, device=device)
                 entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1, keepdim=True) / math.log(num_cls)
                 logits_plus = torch.cat([local_out, margin, entropy], dim=1)
                 local_probs_bk = F.softmax(local_out, dim=1)
@@ -2568,6 +2723,15 @@ def test_DDNN_with_optimized_rule(
                 real_bk = cloud_probs_bk - local_probs_bk
                 dom_in = torch.cat([logits_plus, real_bk], dim=1)
                 dom_logits = offload_mechanism(dom_in)
+            elif input_mode == 'logits_predicted_regression':
+                # Regression approach - predicts bk directly
+                if test_with_real_cloud_logits:
+                    # TESTING: Use real cloud logits
+                    combined_input = torch.cat([local_out, cloud_out], dim=1)  # (B, 20)
+                else:
+                    # PRODUCTION: Use predicted cloud logits
+                    combined_input = compute_logits_predicted_regression(local_out, local_feats, cloud_predictor)
+                dom_logits = offload_mechanism(combined_input)
             elif input_mode in ('feat', 'shallow_feat'):
                 dom_in = local_feats
                 dom_logits = offload_mechanism(dom_in)
@@ -2732,7 +2896,8 @@ def test_offload_finetuning(
             b_star, scheduler,
             input_mode=input_mode, device=device,
             epochs=offload_epochs, lr=1e-3, stop_threshold=0.9,
-            num_classes=num_classes
+            num_classes=num_classes,
+            dataset_name=dataset_name
         )
 
         # now loop thresholds (no retrain)
@@ -2793,7 +2958,8 @@ def test_offload_finetuning(
                 b_star, scheduler,
                 input_mode=input_mode, device=device,
                 epochs=offload_epochs, lr=1e-3, stop_threshold=0.9,
-                num_classes=num_classes
+                num_classes=num_classes,
+                dataset_name=dataset_name
             )
 
             # determine threshold (default fixed)
@@ -2994,7 +3160,8 @@ def test_inference_timing(
             b_star, scheduler,
             input_mode=mode, device=device,
             epochs=offload_epochs, lr=1e-3, stop_threshold=0.9,
-            num_classes=num_classes
+            num_classes=num_classes,
+            dataset_name=dataset_name
         )
         
         # ⬇️ TIMING: Run multiple times and average

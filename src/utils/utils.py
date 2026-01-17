@@ -177,8 +177,41 @@ def create_3d_data_deep(bks, feats, logits, imgs, labels, *, input_mode='feat'):
             entropy = (-probs * torch.log(probs + 1e-9)).sum() / torch.log(torch.tensor(probs.size(0), dtype=torch.float32))
             x_tensor = torch.cat([logits_i, margin.view(1), entropy.view(1)])  # shape (12,)
                                     # ⇒ (12,)
+        elif input_mode == 'hybrid':
+            # ★ HYBRID mode: x_tensor = logits_plus, feats are passed separately
+            logits_i = torch.tensor(logits[i], dtype=torch.float32, device=device)
+            probs    = F.softmax(logits_i, dim=0)
+            top2     = torch.topk(probs, 2).values
+            margin   = top2[0] - top2[1]
+            entropy = (-probs * torch.log(probs + 1e-9)).sum() / torch.log(torch.tensor(probs.size(0), dtype=torch.float32))
+            x_tensor = torch.cat([logits_i, margin.view(1), entropy.view(1)])  # shape (12,)
+            # Features are stored in the 4th element of the tuple
+        elif input_mode == 'logits_with_bk_pred':
+            # ★ NEW: logits_plus + predicted_bk (computed during training)
+            logits_i = torch.tensor(logits[i], dtype=torch.float32, device=device)
+            probs    = F.softmax(logits_i, dim=0)
+            top2     = torch.topk(probs, 2).values
+            margin   = top2[0] - top2[1]
+            entropy = (-probs * torch.log(probs + 1e-9)).sum() / torch.log(torch.tensor(probs.size(0), dtype=torch.float32))
+            x_tensor = torch.cat([logits_i, margin.view(1), entropy.view(1)])  # shape (12,)
+            # predicted_bk will be concatenated during training/evaluation
+        elif input_mode == 'logits_with_real_bk':
+            # ★ TESTING: logits_plus + real_bk (using actual cloud logits)
+            logits_i = torch.tensor(logits[i], dtype=torch.float32, device=device)
+            probs    = F.softmax(logits_i, dim=0)
+            top2     = torch.topk(probs, 2).values
+            margin   = top2[0] - top2[1]
+            entropy = (-probs * torch.log(probs + 1e-9)).sum() / torch.log(torch.tensor(probs.size(0), dtype=torch.float32))
+            x_tensor = torch.cat([logits_i, margin.view(1), entropy.view(1)])  # shape (12,)
+            # real_bk will be concatenated during training/evaluation
+        elif input_mode == 'logits_predicted_regression':
+            # ★ NEW: Regression mode - just store local logits
+            # Input: local_logits (10) + cloud_logits (10) = 20-dim
+            # Cloud logits are concatenated during training/evaluation
+            logits_i = torch.tensor(logits[i], dtype=torch.float32, device=device)
+            x_tensor = logits_i  # shape (10,) - just the local logits
         else:
-            raise ValueError("input_mode must be 'feat'|'logits'|'img'|'logits_plus'")
+            raise ValueError("input_mode must be 'feat'|'logits'|'img'|'logits_plus'|'hybrid'|'logits_with_bk_pred'|'logits_with_real_bk'|'logits_predicted_regression'")
         combined_data.append((x_tensor, float(bks[i]), int(labels[i]), feats[i]))
     return combined_data
 

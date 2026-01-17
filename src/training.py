@@ -187,8 +187,8 @@ def train_deep_offload_mechanism(
     patience=20 , # Number of epochs to wait for early stopping
     return_history=False ,
     num_classes=10,
-    regression_mode=False,  # ★ NEW: Use MSELoss for regression
-    cloud_predictor=None  # ★ NEW: CloudLogitPredictor for logits_with_bk_pred mode
+    cloud_predictor=None,  # CloudLogitPredictor for logits_with_bk_pred mode
+    dataset_name='cifar10'  # Dataset name for checkpoint saving
 ):
     """
     EXW AFAIRESEI TO TRAIN TESTING SE KATHE EPOCH GIA LOGOUS TAXYTHTAS
@@ -221,12 +221,12 @@ def train_deep_offload_mechanism(
     # === Create models directory if it doesn't exist and set checkpoint path ===
     models_dir = "models"
     os.makedirs(models_dir, exist_ok=True)
-    checkpoint_path = os.path.join(models_dir, "best_offload_mechanism.pth")
+    checkpoint_path = os.path.join(models_dir, f"best_offload_mechanism_{dataset_name}.pth")
 
-    # ★ NEW: Choose loss function based on mode
-    if regression_mode:
+    # Choose loss function based on input mode
+    if input_mode == 'logits_predicted_regression':
         criterion = nn.MSELoss()
-        print(f"  [Training] Regression mode: using MSELoss")
+        print(f"  [Regression] Using MSELoss for bk prediction")
     else:
         criterion = nn.BCEWithLogitsLoss()
     
@@ -278,6 +278,17 @@ def train_deep_offload_mechanism(
                 # Concatenate logits_plus with real_bk
                 combined_input = torch.cat([x_tensor, real_bk], dim=1)  # (batch, 22)
                 logits = offload_mechanism(combined_input)
+            elif input_mode == 'logits_predicted_regression':
+                # ★ Regression approach - predict bk directly
+                # TRAINING: Uses REAL cloud logits (available during training)
+                # Input: local_logits (10) + real_cloud_logits (10) = 20-dim
+                local_logits = x_tensor[:, :num_classes]
+                with torch.no_grad():
+                    cloud_cnn.eval()
+                    real_cloud_logits = cloud_cnn(feature_tensor)
+                # Concatenate local and REAL cloud logits for training
+                combined_input = torch.cat([local_logits, real_cloud_logits], dim=1)  # (batch, 20)
+                logits = offload_mechanism(combined_input)
             else:
                 logits = offload_mechanism(x_tensor)
 
@@ -306,14 +317,12 @@ def train_deep_offload_mechanism(
                 threshold,
                 input_mode=input_mode,
                 num_classes=num_classes,
-                regression_mode=regression_mode,  # ★ Pass regression flag
-                cloud_predictor=cloud_predictor  # ★ Pass cloud_predictor
+                cloud_predictor=cloud_predictor
             )
             offload_val_acc = evaluate_offload_decision_accuracy_CNN_test(
                 offload_mechanism, local_feature_extractor, local_classifier, cloud_cnn, val_loader, b_star, threshold,
                 input_mode=input_mode,
-                regression_mode=regression_mode,  # ★ Pass regression flag
-                cloud_predictor=cloud_predictor  # ★ Pass cloud_predictor
+                cloud_predictor=cloud_predictor
             )
 
         offload_scheduler.step(offload_val_acc)
